@@ -142,7 +142,7 @@ impl JoinHashMap {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         JoinHashMap {
             bloom_filter: Some(
-                BloomFilter::with_num_bits(65536)
+                BloomFilter::with_num_bits(8192)
                     .hasher(RandomState::default())
                     .expected_items(capacity),
             ),
