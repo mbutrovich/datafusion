@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::datasource::file_format::parquet::{
-    coerce_file_schema_to_string_type, coerce_file_schema_to_view_type,
+    coerce_file_schema_to_string_type, coerce_file_schema_to_view_type, coerce_int96_to_resolution,
 };
 use crate::datasource::physical_plan::parquet::page_filter::PagePruningAccessPlanFilter;
 use crate::datasource::physical_plan::parquet::row_group_filter::RowGroupAccessPlanFilter;
@@ -34,6 +34,7 @@ use crate::datasource::schema_adapter::SchemaAdapterFactory;
 
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
+use arrow_schema::TimeUnit;
 use datafusion_common::{exec_err, Result};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::pruning::PruningPredicate;
@@ -131,6 +132,8 @@ impl FileOpener for ParquetOpener {
                 ArrowReaderMetadata::load_async(&mut reader, options.clone()).await?;
             let mut schema = Arc::clone(metadata.schema());
 
+            println!["metadata.parquet_schema(): {:?}", metadata.parquet_schema()];
+
             if let Some(merged) =
                 coerce_file_schema_to_string_type(&table_schema, &schema)
             {
@@ -139,6 +142,12 @@ impl FileOpener for ParquetOpener {
 
             // read with view types
             if let Some(merged) = coerce_file_schema_to_view_type(&table_schema, &schema)
+            {
+                schema = Arc::new(merged);
+            }
+
+            // read with view types
+            if let Some(merged) = coerce_int96_to_resolution(metadata.parquet_schema(), &schema, &TimeUnit::Microsecond)
             {
                 schema = Arc::new(merged);
             }

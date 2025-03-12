@@ -43,7 +43,7 @@ use crate::physical_plan::{
 };
 
 use arrow::compute::sum;
-use arrow_schema::{DataType, Field, FieldRef};
+use arrow_schema::{DataType, Field, FieldRef, TimeUnit};
 use datafusion_catalog::Session;
 use datafusion_common::config::{ConfigField, ConfigFileType, TableParquetOptions};
 use datafusion_common::parsers::CompressionTypeVariant;
@@ -80,11 +80,13 @@ use parquet::arrow::arrow_writer::{
 };
 use parquet::arrow::async_reader::MetadataFetch;
 use parquet::arrow::{parquet_to_arrow_schema, ArrowSchemaConverter, AsyncArrowWriter};
+use parquet::basic::Type;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::format::FileMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinSet;
@@ -466,6 +468,68 @@ impl FileFormat for ParquetFormat {
     fn file_source(&self) -> Arc<dyn FileSource> {
         Arc::new(ParquetSource::default())
     }
+}
+
+/// Coerces the file schema if the table schema uses a view type.
+pub fn coerce_int96_to_resolution(
+    parquet_schema: &SchemaDescriptor,
+    file_schema: &Schema,
+    time_unit: &TimeUnit,
+) -> Option<Schema> {
+    println!["parquet_schema: {:?}", parquet_schema];
+    println!["file_schema: {}", file_schema];
+    let mut transform = false;
+    let parquet_fields: HashMap<_, _> = parquet_schema
+        .columns()
+        .iter()
+        .map(|f| {
+            let dt = f.physical_type();
+            if dt.eq(&Type::INT96)
+            {
+                transform = true;
+            }
+            (f.name(), dt)
+        })
+        .collect();
+
+    println!["transform: {}", transform];
+    // println!("parquet_fields: {:?}", parquet_fields);
+
+    if !transform {
+        return None;
+    }
+
+    let transformed_fields: Vec<Arc<Field>> = file_schema
+        .fields
+        .iter()
+        .map(
+            |field| match parquet_fields.get(field.name().as_str()) {
+                Some(Type::INT96) => {
+                    field_with_new_type(field, DataType::Timestamp(*time_unit,None))
+
+                    // match field.data_type() {
+                    //     DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                    //         field_with_new_type(field, DataType::Timestamp(*time_unit,None))
+                    //     }
+                    //     DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) => {
+                    //         field_with_new_type(field, DataType::Timestamp(*time_unit,Some(tz.clone())))
+                    //     }
+                    //     _ => unreachable!()
+                    // }
+
+                },
+                _ => {
+                    println!["not match field: {:?}", field];
+                    Arc::clone(field)
+                },
+            },
+        )
+        .collect();
+
+    Some(Schema::new_with_metadata(
+        transformed_fields,
+        file_schema.metadata.clone(),
+    ))
 }
 
 /// Coerces the file schema if the table schema uses a view type.
