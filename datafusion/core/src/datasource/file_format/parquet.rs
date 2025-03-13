@@ -476,8 +476,6 @@ pub fn coerce_int96_to_resolution(
     file_schema: &Schema,
     time_unit: &TimeUnit,
 ) -> Option<Schema> {
-    println!["parquet_schema: {:?}", parquet_schema];
-    println!["file_schema: {}", file_schema];
     let mut transform = false;
     let parquet_fields: HashMap<_, _> = parquet_schema
         .columns()
@@ -492,8 +490,6 @@ pub fn coerce_int96_to_resolution(
         })
         .collect();
 
-    println!["transform: {}", transform];
-    // println!("parquet_fields: {:?}", parquet_fields);
 
     if !transform {
         return None;
@@ -519,7 +515,6 @@ pub fn coerce_int96_to_resolution(
 
                 },
                 _ => {
-                    println!["not match field: {:?}", field];
                     Arc::clone(field)
                 },
             },

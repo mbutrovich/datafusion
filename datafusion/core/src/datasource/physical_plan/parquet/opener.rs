@@ -132,8 +132,6 @@ impl FileOpener for ParquetOpener {
                 ArrowReaderMetadata::load_async(&mut reader, options.clone()).await?;
             let mut schema = Arc::clone(metadata.schema());
 
-            println!["metadata.parquet_schema(): {:?}", metadata.parquet_schema()];
-
             if let Some(merged) =
                 coerce_file_schema_to_string_type(&table_schema, &schema)
             {
