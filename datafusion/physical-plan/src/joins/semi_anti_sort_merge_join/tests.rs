@@ -140,8 +140,7 @@ async fn dual_join_collect(
     let sa_total: usize = sa_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
         smj_total, sa_total,
-        "Row count mismatch for {:?}: SMJ={}, SA={}",
-        join_type, smj_total, sa_total
+        "Row count mismatch for {join_type:?}: SMJ={smj_total}, SA={sa_total}"
     );
     if smj_total > 0 {
         let smj_str = batches_to_sort_string(&smj_batches);
@@ -149,8 +148,7 @@ async fn dual_join_collect(
         assert_eq!(
             smj_str, sa_str,
             "SortMergeJoin and SemiAntiSortMergeJoin produced different results \
-             for {:?}",
-            join_type
+             for {join_type:?}"
         );
     }
 
@@ -197,8 +195,7 @@ async fn dual_join_collect_with_filter(
     let sa_total: usize = sa_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
         smj_total, sa_total,
-        "Row count mismatch for {:?} with filter: SMJ={}, SA={}",
-        join_type, smj_total, sa_total
+        "Row count mismatch for {join_type:?} with filter: SMJ={smj_total}, SA={sa_total}"
     );
     if smj_total > 0 {
         let smj_str = batches_to_sort_string(&smj_batches);
@@ -206,8 +203,7 @@ async fn dual_join_collect_with_filter(
         assert_eq!(
             smj_str, sa_str,
             "SortMergeJoin and SemiAntiSortMergeJoin produced different results \
-             for {:?} with filter",
-            join_type
+             for {join_type:?} with filter"
         );
     }
 
@@ -1093,8 +1089,7 @@ async fn filter_buffer_pending_loses_inner_rows() -> Result<()> {
     assert_eq!(
         total, 1,
         "LeftSemi with filter: outer row should be emitted because \
-         inner row c2=10 matches filter c1==c2. Got {} rows.",
-        total
+         inner row c2=10 matches filter c1==c2. Got {total} rows."
     );
     Ok(())
 }
@@ -1187,8 +1182,7 @@ async fn no_filter_boundary_pending_loses_outer_rows() -> Result<()> {
     assert_eq!(
         total, 2,
         "LeftSemi no filter: both outer rows (key=1) should be emitted \
-         because inner has key=1. Got {} rows.",
-        total
+         because inner has key=1. Got {total} rows."
     );
     Ok(())
 }
@@ -1295,8 +1289,7 @@ async fn filtered_boundary_pending_outer_rows() -> Result<()> {
     assert_eq!(
         total, 1,
         "LeftSemi filtered boundary: only first outer row (c1=10) matches \
-         filter c1==c2. Got {} rows.",
-        total
+         filter c1==c2. Got {total} rows."
     );
     Ok(())
 }
