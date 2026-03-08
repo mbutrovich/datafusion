@@ -50,7 +50,7 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequiremen
 ///
 /// # Motivation
 ///
-/// The general-purpose [`SortMergeJoinExec`] handles semi/anti joins by
+/// The general-purpose [`SortMergeJoinExec`](super::SortMergeJoinExec) handles semi/anti joins by
 /// materializing `(outer, inner)` row pairs, applying a filter, then using a
 /// "corrected filter mask" to deduplicate. Semi/anti joins only need a boolean
 /// per outer row (does a match exist?), not pairs. The pair-based approach
