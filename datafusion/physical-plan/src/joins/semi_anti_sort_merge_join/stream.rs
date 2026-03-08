@@ -122,8 +122,8 @@ pub(super) struct SemiAntiSortMergeJoinStream {
     /// true for semi (emit matched), false for anti (emit unmatched)
     is_semi: bool,
 
-    // Input streams — "outer" is the probe side whose rows we output,
-    // "inner" is the build side we scan for matches.
+    // Input streams — "outer" is the streamed side whose rows we output,
+    // "inner" is the buffered side we match against.
     outer: SendableRecordBatchStream,
     inner: SendableRecordBatchStream,
 

@@ -238,7 +238,7 @@ impl SemiAntiSortMergeJoinExec {
         })
     }
 
-    /// The outer (probe) side: Left for LeftSemi/LeftAnti, Right for RightSemi/RightAnti.
+    /// The outer (streamed) side: Left for LeftSemi/LeftAnti, Right for RightSemi/RightAnti.
     pub fn probe_side(join_type: &JoinType) -> JoinSide {
         match join_type {
             JoinType::RightSemi | JoinType::RightAnti => JoinSide::Right,
