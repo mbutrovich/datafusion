@@ -319,6 +319,12 @@ fn pushdown_requirement_to_children(
         // `UnionExec` does not have real sort requirements for its input, we
         // just propagate the sort requirements down:
         Ok(Some(vec![Some(parent_required); plan.children().len()]))
+    // TODO: Add sort pushdown support for SemiAntiSortMergeJoinExec.
+    // Semi/anti output is single-sided (outer only), so the push side
+    // is always the outer child (left for Left*, right for Right*) with
+    // no column offset. The blocker is that try_pushdown_requirements_to_join
+    // takes &SortMergeJoinExec — either generalize it to a trait or
+    // duplicate for SemiAntiSortMergeJoinExec.
     } else if let Some(smj) = plan.as_any().downcast_ref::<SortMergeJoinExec>() {
         let left_columns_len = smj.left().schema().fields().len();
         let parent_ordering: Vec<PhysicalSortExpr> = parent_required

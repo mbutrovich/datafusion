@@ -1077,6 +1077,12 @@ config_namespace! {
         /// one range filter.
         pub enable_piecewise_merge_join: bool, default = false
 
+        /// When set to true, the physical planner will use a specialized
+        /// SemiAntiSortMergeJoinExec for semi/anti sort-merge joins instead
+        /// of the general SortMergeJoinExec. The specialized operator avoids
+        /// pair materialization by tracking matches with a bitset.
+        pub enable_semi_anti_sort_merge_join: bool, default = true
+
         /// The maximum estimated size in bytes for one input side of a HashJoin
         /// will be collected into a single partition
         pub hash_join_single_partition_threshold: usize, default = 1024 * 1024

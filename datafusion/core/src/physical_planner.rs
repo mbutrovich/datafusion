@@ -42,7 +42,8 @@ use crate::physical_plan::explain::ExplainExec;
 use crate::physical_plan::filter::FilterExecBuilder;
 use crate::physical_plan::joins::utils as join_utils;
 use crate::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    SemiAntiSortMergeJoinExec, SortMergeJoinExec,
 };
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::projection::{ProjectionExec, ProjectionExpr};
@@ -1513,6 +1514,10 @@ impl DefaultPhysicalPlanner {
 
                 let prefer_hash_join =
                     session_state.config_options().optimizer.prefer_hash_join;
+                let enable_semi_anti_smj = session_state
+                    .config_options()
+                    .optimizer
+                    .enable_semi_anti_sort_merge_join;
 
                 // TODO: Allow PWMJ to deal with residual equijoin conditions
                 let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
@@ -1647,15 +1652,35 @@ impl DefaultPhysicalPlanner {
                 {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
-                    Arc::new(SortMergeJoinExec::try_new(
-                        physical_left,
-                        physical_right,
-                        join_on,
-                        join_filter,
-                        *join_type,
-                        vec![SortOptions::default(); join_on_len],
-                        *null_equality,
-                    )?)
+                    if enable_semi_anti_smj
+                        && matches!(
+                            join_type,
+                            JoinType::LeftSemi
+                                | JoinType::LeftAnti
+                                | JoinType::RightSemi
+                                | JoinType::RightAnti
+                        )
+                    {
+                        Arc::new(SemiAntiSortMergeJoinExec::try_new(
+                            physical_left,
+                            physical_right,
+                            join_on,
+                            join_filter,
+                            *join_type,
+                            vec![SortOptions::default(); join_on_len],
+                            *null_equality,
+                        )?)
+                    } else {
+                        Arc::new(SortMergeJoinExec::try_new(
+                            physical_left,
+                            physical_right,
+                            join_on,
+                            join_filter,
+                            *join_type,
+                            vec![SortOptions::default(); join_on_len],
+                            *null_equality,
+                        )?)
+                    }
                 } else if session_state.config().target_partitions() > 1
                     && session_state.config().repartition_joins()
                     && prefer_hash_join

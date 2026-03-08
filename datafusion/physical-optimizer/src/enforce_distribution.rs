@@ -49,7 +49,8 @@ use datafusion_physical_plan::aggregates::{
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, PartitionMode, SortMergeJoinExec,
+    CrossJoinExec, HashJoinExec, PartitionMode, SemiAntiSortMergeJoinExec,
+    SortMergeJoinExec,
 };
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -379,6 +380,39 @@ pub fn adjust_input_keys_ordering(
             &join_constructor,
         )
         .map(Transformed::yes);
+    } else if let Some(SemiAntiSortMergeJoinExec {
+        left,
+        right,
+        on,
+        filter,
+        join_type,
+        sort_options,
+        null_equality,
+        ..
+    }) = plan.as_any().downcast_ref::<SemiAntiSortMergeJoinExec>()
+    {
+        let join_constructor = |new_conditions: (
+            Vec<(PhysicalExprRef, PhysicalExprRef)>,
+            Vec<SortOptions>,
+        )| {
+            SemiAntiSortMergeJoinExec::try_new(
+                Arc::clone(left),
+                Arc::clone(right),
+                new_conditions.0,
+                filter.clone(),
+                *join_type,
+                new_conditions.1,
+                *null_equality,
+            )
+            .map(|e| Arc::new(e) as _)
+        };
+        return reorder_partitioned_join_keys(
+            requirements,
+            on,
+            sort_options,
+            &join_constructor,
+        )
+        .map(Transformed::yes);
     } else if let Some(aggregate_exec) = plan.as_any().downcast_ref::<AggregateExec>() {
         if !requirements.data.is_empty() {
             if aggregate_exec.mode() == &AggregateMode::FinalPartitioned {
@@ -660,6 +694,46 @@ pub fn reorder_join_keys_to_inputs(
                 .map(|idx| sort_options[positions[idx]])
                 .collect();
             return SortMergeJoinExec::try_new(
+                Arc::clone(left),
+                Arc::clone(right),
+                new_join_on,
+                filter.clone(),
+                *join_type,
+                new_sort_options,
+                *null_equality,
+            )
+            .map(|smj| Arc::new(smj) as _);
+        }
+    } else if let Some(SemiAntiSortMergeJoinExec {
+        left,
+        right,
+        on,
+        filter,
+        join_type,
+        sort_options,
+        null_equality,
+        ..
+    }) = plan_any.downcast_ref::<SemiAntiSortMergeJoinExec>()
+    {
+        let (join_keys, positions) = reorder_current_join_keys(
+            extract_join_keys(on),
+            Some(left.output_partitioning()),
+            Some(right.output_partitioning()),
+            left.equivalence_properties(),
+            right.equivalence_properties(),
+        );
+        if let Some(positions) = positions
+            && !positions.is_empty()
+        {
+            let JoinKeyPairs {
+                left_keys,
+                right_keys,
+            } = join_keys;
+            let new_join_on = new_join_conditions(&left_keys, &right_keys);
+            let new_sort_options = (0..sort_options.len())
+                .map(|idx| sort_options[positions[idx]])
+                .collect();
+            return SemiAntiSortMergeJoinExec::try_new(
                 Arc::clone(left),
                 Arc::clone(right),
                 new_join_on,

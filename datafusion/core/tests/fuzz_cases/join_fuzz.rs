@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::fuzz_cases::join_fuzz::JoinTestType::{HjSmj, NljHj};
+use crate::fuzz_cases::join_fuzz::JoinTestType::{HjSaSmj, HjSmj, NljHj};
 
 use arrow::array::{ArrayRef, BinaryArray, Int32Array};
 use arrow::compute::SortOptions;
@@ -34,7 +34,8 @@ use datafusion::physical_plan::collect;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+    HashJoinExec, NestedLoopJoinExec, PartitionMode, SemiAntiSortMergeJoinExec,
+    SortMergeJoinExec,
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::{NullEquality, ScalarValue};
@@ -55,6 +56,8 @@ enum JoinTestType {
     // compare HashJoin and SortMergeJoin, no need to compare SortMergeJoin and NestedLoopJoin
     // because if existing variants both passed that means SortMergeJoin and NestedLoopJoin also passes
     HjSmj,
+    // compare HashJoin and SemiAntiSortMergeJoin (only valid for semi/anti join types)
+    HjSaSmj,
 }
 
 fn col_lt_col_filter(schema1: Arc<Schema>, schema2: Arc<Schema>) -> JoinFilter {
@@ -210,7 +213,7 @@ async fn test_left_semi_join_1k() {
             JoinType::LeftSemi,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -224,7 +227,7 @@ async fn test_left_semi_join_1k_filtered() {
             JoinType::LeftSemi,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -238,7 +241,7 @@ async fn test_right_semi_join_1k() {
             JoinType::RightSemi,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -252,7 +255,7 @@ async fn test_right_semi_join_1k_filtered() {
             JoinType::RightSemi,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -266,7 +269,7 @@ async fn test_left_anti_join_1k() {
             JoinType::LeftAnti,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -280,7 +283,7 @@ async fn test_left_anti_join_1k_filtered() {
             JoinType::LeftAnti,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -294,7 +297,7 @@ async fn test_right_anti_join_1k() {
             JoinType::RightAnti,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -308,7 +311,7 @@ async fn test_right_anti_join_1k_filtered() {
             JoinType::RightAnti,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -491,7 +494,7 @@ async fn test_left_semi_join_1k_binary() {
             JoinType::LeftSemi,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -505,7 +508,7 @@ async fn test_left_semi_join_1k_binary_filtered() {
             JoinType::LeftSemi,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -519,7 +522,7 @@ async fn test_right_semi_join_1k_binary() {
             JoinType::RightSemi,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -533,7 +536,7 @@ async fn test_right_semi_join_1k_binary_filtered() {
             JoinType::RightSemi,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -547,7 +550,7 @@ async fn test_left_anti_join_1k_binary() {
             JoinType::LeftAnti,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -561,7 +564,7 @@ async fn test_left_anti_join_1k_binary_filtered() {
             JoinType::LeftAnti,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -575,7 +578,7 @@ async fn test_right_anti_join_1k_binary() {
             JoinType::RightAnti,
             None,
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -589,7 +592,7 @@ async fn test_right_anti_join_1k_binary_filtered() {
             JoinType::RightAnti,
             Some(Box::new(col_lt_col_filter)),
         )
-        .run_test(&[HjSmj, NljHj], false)
+        .run_test(&[HjSmj, NljHj, HjSaSmj], false)
         .await
     }
 }
@@ -837,6 +840,22 @@ impl JoinFuzzTestCase {
         )
     }
 
+    fn semi_anti_sort_merge_join(&self) -> Arc<SemiAntiSortMergeJoinExec> {
+        let (left, right) = self.left_right();
+        Arc::new(
+            SemiAntiSortMergeJoinExec::try_new(
+                left,
+                right,
+                self.on_columns().clone(),
+                self.join_filter(),
+                self.join_type,
+                vec![SortOptions::default(); self.on_columns().len()],
+                NullEquality::NullEqualsNothing,
+            )
+            .unwrap(),
+        )
+    }
+
     fn hash_join(&self) -> Arc<HashJoinExec> {
         let (left, right) = self.left_right();
         Arc::new(
@@ -1024,6 +1043,44 @@ impl JoinFuzzTestCase {
                     {
                         assert_eq!(
                             (i, smj_line),
+                            (i, hj_line),
+                            "{}",
+                            err_msg_contents.as_str()
+                        );
+                    }
+                }
+            }
+
+            if join_tests.contains(&HjSaSmj) {
+                let sasmj = self.semi_anti_sort_merge_join();
+                let sasmj_collected = collect(sasmj, task_ctx.clone()).await.unwrap();
+                let sasmj_rows =
+                    sasmj_collected.iter().fold(0, |acc, b| acc + b.num_rows());
+
+                let err_msg_row_cnt = format!(
+                    "HashJoinExec and SemiAntiSortMergeJoinExec produced different row counts, batch_size: {}",
+                    &batch_size
+                );
+                assert_eq!(hj_rows, sasmj_rows, "{}", err_msg_row_cnt.as_str());
+
+                if sasmj_rows > 0 || hj_rows > 0 {
+                    let sasmj_formatted =
+                        pretty_format_batches(&sasmj_collected).unwrap().to_string();
+                    let mut sasmj_formatted_sorted: Vec<&str> =
+                        sasmj_formatted.trim().lines().collect();
+                    sasmj_formatted_sorted.sort_unstable();
+
+                    let err_msg_contents = format!(
+                        "SemiAntiSortMergeJoinExec and HashJoinExec produced different results, batch_size: {}",
+                        &batch_size
+                    );
+                    for (i, (sasmj_line, hj_line)) in sasmj_formatted_sorted
+                        .iter()
+                        .zip(&hj_formatted_sorted)
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            (i, sasmj_line),
                             (i, hj_line),
                             "{}",
                             err_msg_contents.as_str()
