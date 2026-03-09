@@ -64,10 +64,8 @@ fn evaluate_join_keys(
 /// differs from the key at `from`. Uses `compare_join_arrays` for zero-alloc
 /// ordinal comparison.
 ///
-/// Binary search (not `partition_point`) because `compare_join_arrays`
-/// returns `Result` and `partition_point` requires an infallible predicate
-/// on a `&[T]` — using it here would need either allocation or unsafe
-/// pointer arithmetic to recover the probe index.
+/// Optimized for join workloads: checks adjacent and boundary keys before
+/// falling back to binary search, since most key groups are small (often 1).
 fn find_key_group_end(
     key_arrays: &[ArrayRef],
     from: usize,
@@ -75,8 +73,41 @@ fn find_key_group_end(
     sort_options: &[SortOptions],
     null_equality: NullEquality,
 ) -> Result<usize> {
-    let mut lo = from + 1;
-    let mut hi = len;
+    let next = from + 1;
+    if next >= len {
+        return Ok(len);
+    }
+
+    // Fast path: single-row group (common with unique keys).
+    if compare_join_arrays(
+        key_arrays,
+        from,
+        key_arrays,
+        next,
+        sort_options,
+        null_equality,
+    )? != Ordering::Equal
+    {
+        return Ok(next);
+    }
+
+    // Check if the entire remaining batch shares this key.
+    let last = len - 1;
+    if compare_join_arrays(
+        key_arrays,
+        from,
+        key_arrays,
+        last,
+        sort_options,
+        null_equality,
+    )? == Ordering::Equal
+    {
+        return Ok(len);
+    }
+
+    // Binary search the interior: key at `next` matches, key at `last` doesn't.
+    let mut lo = next + 1;
+    let mut hi = last;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if compare_join_arrays(
@@ -640,10 +671,74 @@ impl SemiAntiSortMergeJoinStream {
         Ok(())
     }
 
+    /// Continue processing an outer key group that spans multiple outer
+    /// batches. Returns `true` if this outer batch was fully consumed
+    /// by the key group and the caller should load another.
+    fn resume_boundary(&mut self) -> Result<bool> {
+        debug_assert!(
+            self.outer_batch.is_some(),
+            "caller must load outer_batch first"
+        );
+        match std::mem::replace(&mut self.boundary_state, BoundaryState::Normal) {
+            BoundaryState::NoFilterPending {
+                saved_keys,
+                saved_idx,
+            } => {
+                let same_key = keys_match(
+                    &saved_keys,
+                    saved_idx,
+                    &self.outer_key_arrays,
+                    0,
+                    &self.sort_options,
+                    self.null_equality,
+                )?;
+                if same_key {
+                    self.process_key_match_no_filter()?;
+                    let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
+                    if self.outer_offset >= num_outer {
+                        let new_saved = self.outer_key_arrays.clone();
+                        let new_idx = num_outer - 1;
+                        self.boundary_state = BoundaryState::NoFilterPending {
+                            saved_keys: new_saved,
+                            saved_idx: new_idx,
+                        };
+                        self.emit_outer_batch()?;
+                        self.outer_batch = None;
+                        return Ok(true);
+                    }
+                }
+            }
+            BoundaryState::FilteredPending => {
+                if !self.inner_key_buffer.is_empty() {
+                    let first_inner = &self.inner_key_buffer[0];
+                    let inner_keys = evaluate_join_keys(first_inner, &self.on_inner)?;
+                    let same_key = keys_match(
+                        &self.outer_key_arrays,
+                        0,
+                        &inner_keys,
+                        0,
+                        &self.sort_options,
+                        self.null_equality,
+                    )?;
+                    if same_key {
+                        self.process_key_match_with_filter()?;
+                        let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
+                        if self.outer_offset >= num_outer {
+                            self.boundary_state = BoundaryState::FilteredPending;
+                            self.emit_outer_batch()?;
+                            self.outer_batch = None;
+                            return Ok(true);
+                        }
+                    }
+                }
+                self.clear_inner_key_group();
+            }
+            BoundaryState::Normal => {}
+        }
+        Ok(false)
+    }
+
     /// Main loop: drive the merge-scan to produce output batches.
-    // Clippy can't see that poll_next_outer_batch guarantees
-    // outer_batch = Some(..) when returning Ok(true).
-    #[expect(clippy::panicking_unwrap)]
     fn poll_join(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<RecordBatch>>> {
         let join_time = self.join_time.clone();
         let _timer = join_time.timer();
@@ -663,71 +758,8 @@ impl SemiAntiSortMergeJoinStream {
                         return Poll::Ready(Ok(None));
                     }
                     Ok(true) => {
-                        // Check if we're resuming a boundary loop that was
-                        // interrupted by Pending. See BoundaryState docs.
-                        match std::mem::replace(
-                            &mut self.boundary_state,
-                            BoundaryState::Normal,
-                        ) {
-                            BoundaryState::NoFilterPending {
-                                saved_keys,
-                                saved_idx,
-                            } => {
-                                let same_key = keys_match(
-                                    &saved_keys,
-                                    saved_idx,
-                                    &self.outer_key_arrays,
-                                    0,
-                                    &self.sort_options,
-                                    self.null_equality,
-                                )?;
-                                if same_key {
-                                    self.process_key_match_no_filter()?;
-                                    let num_outer =
-                                        self.outer_batch.as_ref().unwrap().num_rows();
-                                    if self.outer_offset >= num_outer {
-                                        let new_saved = self.outer_key_arrays.clone();
-                                        let new_idx = num_outer - 1;
-                                        self.boundary_state =
-                                            BoundaryState::NoFilterPending {
-                                                saved_keys: new_saved,
-                                                saved_idx: new_idx,
-                                            };
-                                        self.emit_outer_batch()?;
-                                        self.outer_batch = None;
-                                        continue;
-                                    }
-                                }
-                            }
-                            BoundaryState::FilteredPending => {
-                                if !self.inner_key_buffer.is_empty() {
-                                    let first_inner = &self.inner_key_buffer[0];
-                                    let inner_keys =
-                                        evaluate_join_keys(first_inner, &self.on_inner)?;
-                                    let same_key = keys_match(
-                                        &self.outer_key_arrays,
-                                        0,
-                                        &inner_keys,
-                                        0,
-                                        &self.sort_options,
-                                        self.null_equality,
-                                    )?;
-                                    if same_key {
-                                        self.process_key_match_with_filter()?;
-                                        let num_outer =
-                                            self.outer_batch.as_ref().unwrap().num_rows();
-                                        if self.outer_offset >= num_outer {
-                                            self.boundary_state =
-                                                BoundaryState::FilteredPending;
-                                            self.emit_outer_batch()?;
-                                            self.outer_batch = None;
-                                            continue;
-                                        }
-                                    }
-                                }
-                                self.clear_inner_key_group();
-                            }
-                            BoundaryState::Normal => {}
+                        if self.resume_boundary()? {
+                            continue;
                         }
                     }
                 }
