@@ -152,9 +152,14 @@ enum BoundaryState {
         saved_idx: usize,
     },
     /// The filtered boundary loop's `poll_next_outer_batch` returned
-    /// Pending. The `inner_key_buffer` field already holds the buffered
-    /// inner rows needed to resume filter evaluation.
-    FilteredPending,
+    /// Pending. Carries the key arrays and index from the last emitted
+    /// outer batch so we can compare with the next batch's first key
+    /// without reading from the inner key buffer (which may have been
+    /// spilled to disk).
+    FilteredPending {
+        saved_keys: Vec<ArrayRef>,
+        saved_idx: usize,
+    },
 }
 
 pub(super) struct SemiAntiSortMergeJoinStream {
@@ -708,36 +713,35 @@ impl SemiAntiSortMergeJoinStream {
                     }
                 }
             }
-            BoundaryState::FilteredPending => {
+            BoundaryState::FilteredPending {
+                saved_keys,
+                saved_idx,
+            } => {
                 debug_assert!(
                     !self.inner_key_buffer.is_empty() || self.inner_key_spill.is_some(),
-                    "FilteredPending requires inner key data in buffer or spill"
+                    "FilteredPending entered but no inner key data exists"
                 );
-                if !self.inner_key_buffer.is_empty() {
-                    let first_inner = &self.inner_key_buffer[0];
-                    let inner_keys = evaluate_join_keys(first_inner, &self.on_inner)?;
-                    let same_key = keys_match(
-                        &self.outer_key_arrays,
-                        0,
-                        &inner_keys,
-                        0,
-                        &self.sort_options,
-                        self.null_equality,
-                    )?;
-                    if same_key {
-                        self.process_key_match_with_filter()?;
-                        let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
-                        if self.outer_offset >= num_outer {
-                            debug_assert!(
-                                !self.inner_key_buffer.is_empty()
-                                    || self.inner_key_spill.is_some(),
-                                "FilteredPending requires inner key data in buffer or spill"
-                            );
-                            self.boundary_state = BoundaryState::FilteredPending;
-                            self.emit_outer_batch()?;
-                            self.outer_batch = None;
-                            return Ok(true);
-                        }
+                let same_key = keys_match(
+                    &saved_keys,
+                    saved_idx,
+                    &self.outer_key_arrays,
+                    0,
+                    &self.sort_options,
+                    self.null_equality,
+                )?;
+                if same_key {
+                    self.process_key_match_with_filter()?;
+                    let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
+                    if self.outer_offset >= num_outer {
+                        let new_saved = self.outer_key_arrays.clone();
+                        let new_idx = num_outer - 1;
+                        self.boundary_state = BoundaryState::FilteredPending {
+                            saved_keys: new_saved,
+                            saved_idx: new_idx,
+                        };
+                        self.emit_outer_batch()?;
+                        self.outer_batch = None;
+                        return Ok(true);
                     }
                 }
                 self.clear_inner_key_group();
@@ -919,13 +923,19 @@ impl SemiAntiSortMergeJoinStream {
 
                             let outer_batch = self.outer_batch.as_ref().unwrap();
                             if self.outer_offset >= outer_batch.num_rows() {
+                                let saved_keys = self.outer_key_arrays.clone();
+                                let saved_idx = outer_batch.num_rows() - 1;
+
                                 self.emit_outer_batch()?;
                                 debug_assert!(
                                     !self.inner_key_buffer.is_empty()
                                         || self.inner_key_spill.is_some(),
                                     "FilteredPending requires inner key data in buffer or spill"
                                 );
-                                self.boundary_state = BoundaryState::FilteredPending;
+                                self.boundary_state = BoundaryState::FilteredPending {
+                                    saved_keys,
+                                    saved_idx,
+                                };
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
                                     Err(e) => return Poll::Ready(Err(e)),
@@ -935,24 +945,26 @@ impl SemiAntiSortMergeJoinStream {
                                         break;
                                     }
                                     Ok(true) => {
-                                        self.boundary_state = BoundaryState::Normal;
-                                        if !self.inner_key_buffer.is_empty() {
-                                            let first_inner = &self.inner_key_buffer[0];
-                                            let inner_keys = evaluate_join_keys(
-                                                first_inner,
-                                                &self.on_inner,
-                                            )?;
-                                            let same = keys_match(
-                                                &self.outer_key_arrays,
-                                                0,
-                                                &inner_keys,
-                                                0,
-                                                &self.sort_options,
-                                                self.null_equality,
-                                            )?;
-                                            if same {
-                                                continue;
-                                            }
+                                        let BoundaryState::FilteredPending {
+                                            saved_keys,
+                                            saved_idx,
+                                        } = std::mem::replace(
+                                            &mut self.boundary_state,
+                                            BoundaryState::Normal,
+                                        )
+                                        else {
+                                            unreachable!()
+                                        };
+                                        let same = keys_match(
+                                            &saved_keys,
+                                            saved_idx,
+                                            &self.outer_key_arrays,
+                                            0,
+                                            &self.sort_options,
+                                            self.null_equality,
+                                        )?;
+                                        if same {
+                                            continue;
                                         }
                                         break;
                                     }
