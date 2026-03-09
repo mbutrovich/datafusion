@@ -1131,7 +1131,7 @@ async fn filter_buffer_pending_loses_inner_rows() -> Result<()> {
 /// When an outer key group spans a batch boundary, the no-filter path
 /// emits the current batch, then polls for the next outer batch. If
 /// poll returns Pending, poll_join exits. On re-entry, without the
-/// BoundaryState fix, the new batch is processed fresh by the
+/// PendingBoundary fix, the new batch is processed fresh by the
 /// merge-scan. Since inner already advanced past this key, the outer
 /// rows with the matching key are skipped via Ordering::Less.
 ///
@@ -1474,7 +1474,7 @@ async fn spill_with_filter() -> Result<()> {
     Ok(())
 }
 
-/// Reproduces a bug where `resume_boundary` for the FilteredPending case
+/// Reproduces a bug where `resume_boundary` for the Filtered pending case
 /// only checks `inner_key_buffer.is_empty()` but ignores `inner_key_spill`.
 /// After spilling, the in-memory buffer is cleared while the spill file
 /// holds the data. If the outer key group spans a batch boundary, the

@@ -112,7 +112,7 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequiremen
 ///
 /// Key groups can span batch boundaries on either side. The stream handles
 /// this by detecting when a group extends to the end of a batch, loading the
-/// next batch, and continuing if the key matches. The `BoundaryState` enum
+/// next batch, and continuing if the key matches. The `PendingBoundary` enum
 /// preserves loop context across async `Poll::Pending` re-entries.
 ///
 /// # Memory

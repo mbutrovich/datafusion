@@ -127,9 +127,6 @@ fn find_key_group_end(
     Ok(lo)
 }
 
-/// Tracks whether we're mid-key-group when `poll_next_outer_batch` returns
-/// `Poll::Pending` inside the Equal branch's boundary loop.
-///
 /// When an outer key group spans a batch boundary, the boundary loop emits
 /// the current batch, then polls for the next. If that poll returns Pending,
 /// `ready!` exits `poll_join` and we re-enter from the top on the next call.
@@ -137,29 +134,17 @@ fn find_key_group_end(
 /// merge-scan — but inner already advanced past this key, so the matching
 /// outer rows would be skipped via `Ordering::Less` and never marked.
 ///
-/// This enum saves the context needed to resume the boundary loop on
-/// re-entry: compare the new batch's first key with the saved key to
-/// decide whether to continue marking or move on.
+/// This enum carries the last key (as single-row sliced arrays) from the
+/// previous batch so we can check whether the next batch continues the same
+/// key group. Stored as `Option<PendingBoundary>`: `None` means normal
+/// processing.
 #[derive(Debug)]
-/// When a key group spans an outer batch boundary, we poll for the next
-/// outer batch. If that poll returns `Pending`, we must yield back to the
-/// executor — but we need to remember where we were so we can resume.
-/// This enum carries the last key from the previous batch so we can check
-/// whether the next batch continues the same key group.
-///
-/// Stored as `Option<PendingBoundary>`: `None` means normal processing.
 enum PendingBoundary {
     /// Resuming a no-filter boundary loop.
-    NoFilter {
-        saved_keys: Vec<ArrayRef>,
-        saved_idx: usize,
-    },
+    NoFilter { saved_keys: Vec<ArrayRef> },
     /// Resuming a filtered boundary loop. Inner key data remains in the
     /// buffer (or spill file) for the resumed loop.
-    Filtered {
-        saved_keys: Vec<ArrayRef>,
-        saved_idx: usize,
-    },
+    Filtered { saved_keys: Vec<ArrayRef> },
 }
 
 pub(super) struct SemiAntiSortMergeJoinStream {
@@ -465,8 +450,7 @@ impl SemiAntiSortMergeJoinStream {
             }
 
             // Key group extends to end of batch — need to check next batch
-            let last_key_idx = num_inner - 1;
-            let saved_inner_keys = self.inner_key_arrays.clone();
+            let saved_inner_keys = slice_keys(&self.inner_key_arrays, num_inner - 1);
 
             match ready!(self.poll_next_inner_batch(cx)) {
                 Err(e) => return Poll::Ready(Err(e)),
@@ -476,9 +460,7 @@ impl SemiAntiSortMergeJoinStream {
                 Ok(true) => {
                     if keys_match(
                         &saved_inner_keys,
-                        last_key_idx,
                         &self.inner_key_arrays,
-                        0,
                         &self.sort_options,
                         self.null_equality,
                     )? {
@@ -554,8 +536,7 @@ impl SemiAntiSortMergeJoinStream {
             resume_from_poll = false;
 
             // Key group extends to end of batch — check next
-            let last_key_idx = num_inner - 1;
-            let saved_inner_keys = self.inner_key_arrays.clone();
+            let saved_inner_keys = slice_keys(&self.inner_key_arrays, num_inner - 1);
 
             // If poll returns Pending, the current batch is already
             // in inner_key_buffer.
@@ -573,9 +554,7 @@ impl SemiAntiSortMergeJoinStream {
                     self.buffering_inner_pending = false;
                     if keys_match(
                         &saved_inner_keys,
-                        last_key_idx,
                         &self.inner_key_arrays,
-                        0,
                         &self.sort_options,
                         self.null_equality,
                     )? {
@@ -685,15 +664,10 @@ impl SemiAntiSortMergeJoinStream {
             "caller must load outer_batch first"
         );
         match self.pending_boundary.take() {
-            Some(PendingBoundary::NoFilter {
-                saved_keys,
-                saved_idx,
-            }) => {
+            Some(PendingBoundary::NoFilter { saved_keys }) => {
                 let same_key = keys_match(
                     &saved_keys,
-                    saved_idx,
                     &self.outer_key_arrays,
-                    0,
                     &self.sort_options,
                     self.null_equality,
                 )?;
@@ -701,11 +675,8 @@ impl SemiAntiSortMergeJoinStream {
                     self.process_key_match_no_filter()?;
                     let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
                     if self.outer_offset >= num_outer {
-                        let new_saved = self.outer_key_arrays.clone();
-                        let new_idx = num_outer - 1;
                         self.pending_boundary = Some(PendingBoundary::NoFilter {
-                            saved_keys: new_saved,
-                            saved_idx: new_idx,
+                            saved_keys: slice_keys(&self.outer_key_arrays, num_outer - 1),
                         });
                         self.emit_outer_batch()?;
                         self.outer_batch = None;
@@ -713,19 +684,14 @@ impl SemiAntiSortMergeJoinStream {
                     }
                 }
             }
-            Some(PendingBoundary::Filtered {
-                saved_keys,
-                saved_idx,
-            }) => {
+            Some(PendingBoundary::Filtered { saved_keys }) => {
                 debug_assert!(
                     !self.inner_key_buffer.is_empty() || self.inner_key_spill.is_some(),
-                    "FilteredPending entered but no inner key data exists"
+                    "Filtered pending boundary entered but no inner key data exists"
                 );
                 let same_key = keys_match(
                     &saved_keys,
-                    saved_idx,
                     &self.outer_key_arrays,
-                    0,
                     &self.sort_options,
                     self.null_equality,
                 )?;
@@ -733,11 +699,8 @@ impl SemiAntiSortMergeJoinStream {
                     self.process_key_match_with_filter()?;
                     let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
                     if self.outer_offset >= num_outer {
-                        let new_saved = self.outer_key_arrays.clone();
-                        let new_idx = num_outer - 1;
                         self.pending_boundary = Some(PendingBoundary::Filtered {
-                            saved_keys: new_saved,
-                            saved_idx: new_idx,
+                            saved_keys: slice_keys(&self.outer_key_arrays, num_outer - 1),
                         });
                         self.emit_outer_batch()?;
                         self.outer_batch = None;
@@ -779,7 +742,7 @@ impl SemiAntiSortMergeJoinStream {
             }
 
             // 2. Ensure we have an inner batch (unless inner is exhausted).
-            // Skip this when in a boundary state — inner was already
+            // Skip this when resuming a pending boundary — inner was already
             // advanced past the key group before the boundary loop started.
             if self.inner_batch.is_none() && self.pending_boundary.is_none() {
                 match ready!(self.poll_next_inner_batch(cx)) {
@@ -877,8 +840,8 @@ impl SemiAntiSortMergeJoinStream {
                         self.null_equality,
                     )?;
                     if group_end >= num_inner {
-                        let saved_keys = self.inner_key_arrays.clone();
-                        let saved_idx = num_inner - 1;
+                        let saved_keys =
+                            slice_keys(&self.inner_key_arrays, num_inner - 1);
                         match ready!(self.poll_next_inner_batch(cx)) {
                             Err(e) => return Poll::Ready(Err(e)),
                             Ok(false) => {
@@ -888,9 +851,7 @@ impl SemiAntiSortMergeJoinStream {
                             Ok(true) => {
                                 if keys_match(
                                     &saved_keys,
-                                    saved_idx,
                                     &self.inner_key_arrays,
-                                    0,
                                     &self.sort_options,
                                     self.null_equality,
                                 )? {
@@ -921,19 +882,19 @@ impl SemiAntiSortMergeJoinStream {
 
                             let outer_batch = self.outer_batch.as_ref().unwrap();
                             if self.outer_offset >= outer_batch.num_rows() {
-                                let saved_keys = self.outer_key_arrays.clone();
-                                let saved_idx = outer_batch.num_rows() - 1;
+                                let saved_keys = slice_keys(
+                                    &self.outer_key_arrays,
+                                    outer_batch.num_rows() - 1,
+                                );
 
                                 self.emit_outer_batch()?;
                                 debug_assert!(
                                     !self.inner_key_buffer.is_empty()
                                         || self.inner_key_spill.is_some(),
-                                    "FilteredPending requires inner key data in buffer or spill"
+                                    "Filtered pending boundary requires inner key data in buffer or spill"
                                 );
-                                self.pending_boundary = Some(PendingBoundary::Filtered {
-                                    saved_keys,
-                                    saved_idx,
-                                });
+                                self.pending_boundary =
+                                    Some(PendingBoundary::Filtered { saved_keys });
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
                                     Err(e) => return Poll::Ready(Err(e)),
@@ -945,16 +906,13 @@ impl SemiAntiSortMergeJoinStream {
                                     Ok(true) => {
                                         let Some(PendingBoundary::Filtered {
                                             saved_keys,
-                                            saved_idx,
                                         }) = self.pending_boundary.take()
                                         else {
                                             unreachable!()
                                         };
                                         let same = keys_match(
                                             &saved_keys,
-                                            saved_idx,
                                             &self.outer_key_arrays,
-                                            0,
                                             &self.sort_options,
                                             self.null_equality,
                                         )?;
@@ -983,14 +941,12 @@ impl SemiAntiSortMergeJoinStream {
 
                             let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
                             if self.outer_offset >= num_outer {
-                                let saved_keys = self.outer_key_arrays.clone();
-                                let saved_idx = num_outer - 1;
+                                let saved_keys =
+                                    slice_keys(&self.outer_key_arrays, num_outer - 1);
 
                                 self.emit_outer_batch()?;
-                                self.pending_boundary = Some(PendingBoundary::NoFilter {
-                                    saved_keys,
-                                    saved_idx,
-                                });
+                                self.pending_boundary =
+                                    Some(PendingBoundary::NoFilter { saved_keys });
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
                                     Err(e) => return Poll::Ready(Err(e)),
@@ -1002,16 +958,13 @@ impl SemiAntiSortMergeJoinStream {
                                     Ok(true) => {
                                         let Some(PendingBoundary::NoFilter {
                                             saved_keys,
-                                            saved_idx,
                                         }) = self.pending_boundary.take()
                                         else {
                                             unreachable!()
                                         };
                                         let same_key = keys_match(
                                             &saved_keys,
-                                            saved_idx,
                                             &self.outer_key_arrays,
-                                            0,
                                             &self.sort_options,
                                             self.null_equality,
                                         )?;
@@ -1091,20 +1044,26 @@ fn eval_filter_for_inner_slice(
     Ok(matched_count)
 }
 
-/// Compare two key rows using the sort options to determine equality.
+/// Slice each key array to a single row at `idx`.
+fn slice_keys(keys: &[ArrayRef], idx: usize) -> Vec<ArrayRef> {
+    keys.iter().map(|a| a.slice(idx, 1)).collect()
+}
+
+/// Compare the first row of two key arrays using sort options to determine
+/// equality. The left side is expected to be single-row slices (from
+/// `slice_keys`); the right side can be any length (row 0 is compared).
 fn keys_match(
     left_arrays: &[ArrayRef],
-    left_idx: usize,
     right_arrays: &[ArrayRef],
-    right_idx: usize,
     sort_options: &[SortOptions],
     null_equality: NullEquality,
 ) -> Result<bool> {
+    debug_assert!(left_arrays.iter().all(|a| a.len() == 1));
     let cmp = compare_join_arrays(
         left_arrays,
-        left_idx,
+        0,
         right_arrays,
-        right_idx,
+        0,
         sort_options,
         null_equality,
     )?;
