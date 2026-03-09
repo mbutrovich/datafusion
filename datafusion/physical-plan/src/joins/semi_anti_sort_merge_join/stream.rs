@@ -18,22 +18,30 @@
 //! Stream implementation for semi/anti sort-merge joins.
 
 use std::cmp::Ordering;
+use std::fs::File;
+use std::io::BufReader;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::RecordBatchStream;
 use crate::joins::utils::{JoinFilter, compare_join_arrays};
-use crate::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
+use crate::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder,
+};
+use crate::spill::spill_manager::SpillManager;
 use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBufferBuilder, RecordBatch};
 use arrow::compute::{BatchCoalescer, SortOptions, filter_record_batch, not};
 use arrow::datatypes::SchemaRef;
+use arrow::ipc::reader::StreamReader;
 use arrow::util::bit_chunk_iterator::UnalignedBitChunk;
 use arrow::util::bit_util::apply_bitwise_binary_op;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, ScalarValue, internal_err,
 };
 use datafusion_execution::SendableRecordBatchStream;
+use datafusion_execution::disk_manager::RefCountedTempFile;
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 
 use futures::{Stream, StreamExt, ready};
@@ -145,8 +153,9 @@ pub(super) struct SemiAntiSortMergeJoinStream {
     // Inner key group buffer: all inner rows sharing the current join key.
     // Only populated when a filter is present. Unbounded — a single key
     // with many inner rows will buffer them all. See "Degenerate cases"
-    // in exec.rs. TODO: spill support for large key groups.
+    // in exec.rs. Spilled to disk when memory reservation fails.
     inner_key_buffer: Vec<RecordBatch>,
+    inner_key_spill: Option<RefCountedTempFile>,
 
     // True when buffer_inner_key_group returned Pending after partially
     // filling inner_key_buffer. On re-entry, buffer_inner_key_group
@@ -176,6 +185,15 @@ pub(super) struct SemiAntiSortMergeJoinStream {
     input_batches: Count,
     input_rows: Count,
     baseline_metrics: BaselineMetrics,
+    peak_mem_used: Gauge,
+
+    // Memory / spill — only the inner key buffer is tracked via reservation,
+    // matching existing SMJ (which tracks only the buffered side). The outer
+    // batch is a single batch at a time and cannot be spilled.
+    reservation: MemoryReservation,
+    spill_manager: SpillManager,
+    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+    inner_buffer_size: usize,
 
     // True once the current outer batch has been emitted. The Equal
     // branch's inner loops call emit then `ready!(poll_next_outer_batch)`.
@@ -201,6 +219,10 @@ impl SemiAntiSortMergeJoinStream {
         batch_size: usize,
         partition: usize,
         metrics: &ExecutionPlanMetricsSet,
+        reservation: MemoryReservation,
+        peak_mem_used: Gauge,
+        spill_manager: SpillManager,
+        runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
     ) -> Result<Self> {
         let is_semi = matches!(join_type, JoinType::LeftSemi | JoinType::RightSemi);
         let outer_is_left = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
@@ -223,6 +245,7 @@ impl SemiAntiSortMergeJoinStream {
             inner_key_arrays: vec![],
             matched: BooleanBufferBuilder::new(0),
             inner_key_buffer: vec![],
+            inner_key_spill: None,
             buffering_inner_pending: false,
             boundary_state: BoundaryState::Normal,
             on_outer,
@@ -238,8 +261,47 @@ impl SemiAntiSortMergeJoinStream {
             input_batches,
             input_rows,
             baseline_metrics,
+            peak_mem_used,
+            reservation,
+            spill_manager,
+            runtime_env,
+            inner_buffer_size: 0,
             batch_emitted: false,
         })
+    }
+
+    /// Resize the memory reservation to match current tracked usage.
+    fn try_resize_reservation(&mut self) -> Result<()> {
+        let needed = self.inner_buffer_size;
+        self.reservation.try_resize(needed)?;
+        self.peak_mem_used.set_max(self.reservation.size());
+        Ok(())
+    }
+
+    /// Spill the in-memory inner key buffer to disk and clear it.
+    fn spill_inner_key_buffer(&mut self) -> Result<()> {
+        let spill_file = self
+            .spill_manager
+            .spill_record_batch_and_finish(
+                &self.inner_key_buffer,
+                "semi_anti_smj_inner_key_spill",
+            )?
+            .expect("inner_key_buffer is non-empty when spilling");
+        self.inner_key_buffer.clear();
+        self.inner_buffer_size = 0;
+        self.inner_key_spill = Some(spill_file);
+        // Should succeed now — inner buffer has been spilled.
+        self.try_resize_reservation()
+    }
+
+    /// Clear inner key group state after processing. Does not resize the
+    /// reservation — the next key group will resize when buffering, or
+    /// the stream's Drop will free it. This avoids unnecessary memory
+    /// pool interactions (see apache/datafusion#20729).
+    fn clear_inner_key_group(&mut self) {
+        self.inner_key_buffer.clear();
+        self.inner_key_spill = None;
+        self.inner_buffer_size = 0;
     }
 
     /// Poll for the next outer batch. Returns true if a batch was loaded.
@@ -410,7 +472,7 @@ impl SemiAntiSortMergeJoinStream {
             self.buffering_inner_pending = false;
             resume_from_poll = true;
         } else {
-            self.inner_key_buffer.clear();
+            self.clear_inner_key_group();
         }
 
         loop {
@@ -430,7 +492,23 @@ impl SemiAntiSortMergeJoinStream {
             if !resume_from_poll {
                 let slice =
                     inner_batch.slice(self.inner_offset, group_end - self.inner_offset);
+                self.inner_buffer_size += slice.get_array_memory_size();
                 self.inner_key_buffer.push(slice);
+
+                // Reserve memory for the newly buffered slice. If the pool
+                // is exhausted, spill the entire buffer to disk.
+                if self.try_resize_reservation().is_err() {
+                    if self.runtime_env.disk_manager.tmp_files_enabled() {
+                        self.spill_inner_key_buffer()?;
+                    } else {
+                        // Re-attempt to get the error message
+                        self.try_resize_reservation().map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "{e}. Disk spilling disabled."
+                            ))
+                        })?;
+                    }
+                }
 
                 if group_end < num_inner {
                     self.inner_offset = group_end;
@@ -484,8 +562,8 @@ impl SemiAntiSortMergeJoinStream {
 
         // buffer_inner_key_group must be called before this function
         debug_assert!(
-            !self.inner_key_buffer.is_empty(),
-            "process_key_match_with_filter called with empty inner_key_buffer"
+            !self.inner_key_buffer.is_empty() || self.inner_key_spill.is_some(),
+            "process_key_match_with_filter called with no inner key data"
         );
         debug_assert!(
             self.outer_offset < num_outer,
@@ -514,49 +592,47 @@ impl SemiAntiSortMergeJoinStream {
         )
         .count_ones();
 
+        // Process spilled inner batches first (read back from disk).
+        if let Some(spill_file) = &self.inner_key_spill {
+            let file = BufReader::new(File::open(spill_file.path())?);
+            let reader = StreamReader::try_new(file, None)?;
+            for batch_result in reader {
+                let inner_slice = batch_result?;
+                matched_count = eval_filter_for_inner_slice(
+                    self.outer_is_left,
+                    filter,
+                    &outer_slice,
+                    &inner_slice,
+                    &mut self.matched,
+                    self.outer_offset,
+                    outer_group_len,
+                    matched_count,
+                )?;
+                if matched_count == outer_group_len {
+                    break;
+                }
+            }
+        }
+
+        // Then process in-memory inner batches.
         // evaluate_filter_for_inner_row is a free function (not &self method)
         // so that Rust can split the struct borrow: &mut self.matched coexists
         // with &self.inner_key_buffer and &self.filter inside this loop.
-        'outer: for inner_slice in &self.inner_key_buffer {
-            for inner_row in 0..inner_slice.num_rows() {
-                if matched_count == outer_group_len {
-                    break 'outer;
-                }
-
-                let filter_result = evaluate_filter_for_inner_row(
+        if matched_count < outer_group_len {
+            'outer: for inner_slice in &self.inner_key_buffer {
+                matched_count = eval_filter_for_inner_slice(
                     self.outer_is_left,
                     filter,
                     &outer_slice,
                     inner_slice,
-                    inner_row,
+                    &mut self.matched,
+                    self.outer_offset,
+                    outer_group_len,
+                    matched_count,
                 )?;
-
-                // OR filter results into the matched bitset. Both sides are
-                // bit-packed [u8] buffers, so apply_bitwise_binary_op
-                // processes 64 bits per loop iteration (not 1 bit at a time).
-                //
-                // The offsets handle alignment: self.outer_offset is the bit
-                // position within self.matched where this key group starts,
-                // and filter_buf.offset() is the BooleanBuffer's internal
-                // bit offset (usually 0, but not guaranteed by Arrow).
-                let filter_buf = filter_result.values();
-                apply_bitwise_binary_op(
-                    self.matched.as_slice_mut(),
-                    self.outer_offset,
-                    filter_buf.inner().as_slice(),
-                    filter_buf.offset(),
-                    outer_group_len,
-                    |a, b| a | b,
-                );
-
-                // Recount matched bits after the OR. UnalignedBitChunk is
-                // zero-copy — it reads the bytes in place and uses popcnt.
-                matched_count = UnalignedBitChunk::new(
-                    self.matched.as_slice(),
-                    self.outer_offset,
-                    outer_group_len,
-                )
-                .count_ones();
+                if matched_count == outer_group_len {
+                    break 'outer;
+                }
             }
         }
 
@@ -649,7 +725,7 @@ impl SemiAntiSortMergeJoinStream {
                                         }
                                     }
                                 }
-                                self.inner_key_buffer.clear();
+                                self.clear_inner_key_group();
                             }
                             BoundaryState::Normal => {}
                         }
@@ -840,7 +916,7 @@ impl SemiAntiSortMergeJoinStream {
                             }
                         }
 
-                        self.inner_key_buffer.clear();
+                        self.clear_inner_key_group();
                     } else {
                         // No filter: advance inner past key group, then
                         // mark all outer rows with this key as matched.
@@ -914,6 +990,60 @@ impl SemiAntiSortMergeJoinStream {
             }
         }
     }
+}
+
+/// Evaluate the filter for all rows in an inner slice against the outer group,
+/// OR-ing results into the matched bitset. Returns the updated matched count.
+/// Extracted as a free function so Rust can split borrows on the stream struct.
+#[expect(clippy::too_many_arguments)]
+fn eval_filter_for_inner_slice(
+    outer_is_left: bool,
+    filter: &JoinFilter,
+    outer_slice: &RecordBatch,
+    inner_slice: &RecordBatch,
+    matched: &mut BooleanBufferBuilder,
+    outer_offset: usize,
+    outer_group_len: usize,
+    mut matched_count: usize,
+) -> Result<usize> {
+    for inner_row in 0..inner_slice.num_rows() {
+        if matched_count == outer_group_len {
+            break;
+        }
+
+        let filter_result = evaluate_filter_for_inner_row(
+            outer_is_left,
+            filter,
+            outer_slice,
+            inner_slice,
+            inner_row,
+        )?;
+
+        // OR filter results into the matched bitset. Both sides are
+        // bit-packed [u8] buffers, so apply_bitwise_binary_op
+        // processes 64 bits per loop iteration (not 1 bit at a time).
+        //
+        // The offsets handle alignment: outer_offset is the bit
+        // position within matched where this key group starts,
+        // and filter_buf.offset() is the BooleanBuffer's internal
+        // bit offset (usually 0, but not guaranteed by Arrow).
+        let filter_buf = filter_result.values();
+        apply_bitwise_binary_op(
+            matched.as_slice_mut(),
+            outer_offset,
+            filter_buf.inner().as_slice(),
+            filter_buf.offset(),
+            outer_group_len,
+            |a, b| a | b,
+        );
+
+        // Recount matched bits after the OR. UnalignedBitChunk is
+        // zero-copy — it reads the bytes in place and uses popcnt.
+        matched_count =
+            UnalignedBitChunk::new(matched.as_slice(), outer_offset, outer_group_len)
+                .count_ones();
+    }
+    Ok(matched_count)
 }
 
 /// Compare two key rows using the sort options to determine equality.

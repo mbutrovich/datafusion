@@ -29,7 +29,8 @@ use crate::joins::utils::{
     JoinFilter, JoinOn, JoinOnRef, build_join_schema, check_join_is_valid,
     estimate_join_statistics, symmetric_join_output_partitioning,
 };
-use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics};
+use crate::spill::spill_manager::SpillManager;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
     PlanProperties, SendableRecordBatchStream, Statistics,
@@ -42,6 +43,7 @@ use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_eq_or_internal_err, plan_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
@@ -116,10 +118,13 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequiremen
 /// # Memory
 ///
 /// Memory usage is bounded and independent of total input size:
-/// - One outer batch at a time
+/// - One outer batch at a time (not tracked by reservation — single batch,
+///   cannot be spilled since it's needed for filter evaluation)
 /// - One inner batch at a time (streaming)
 /// - `matched` bitset: one bit per outer row, re-allocated per batch
-/// - Inner key group buffer: only for filtered joins, one key group at a time
+/// - Inner key group buffer: only for filtered joins, one key group at a time.
+///   Tracked via `MemoryReservation`; spilled to disk when the memory pool
+///   limit is exceeded.
 /// - `BatchCoalescer`: output buffering to target batch size
 ///
 /// # Degenerate cases
@@ -127,9 +132,10 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequiremen
 /// **Highly skewed key (filtered joins only):** When a filter is present,
 /// the inner key group is buffered so each inner row can be evaluated
 /// against the outer group. If one join key has N inner rows, all N rows
-/// are held in memory simultaneously. With uniform key distribution this
-/// is small (inner_rows / num_distinct_keys), but a single hot key can
-/// buffer arbitrarily many rows. The no-filter path does not buffer inner
+/// are held in memory simultaneously (or spilled to disk if the memory
+/// pool limit is reached). With uniform key distribution this is small
+/// (inner_rows / num_distinct_keys), but a single hot key can buffer
+/// arbitrarily many rows. The no-filter path does not buffer inner
 /// rows — it only advances the cursor — so it is unaffected.
 ///
 /// **Scalar broadcast during filter evaluation:** Each inner row is
@@ -448,6 +454,17 @@ impl ExecutionPlan for SemiAntiSortMergeJoinExec {
         let inner = inner.execute(partition, Arc::clone(&context))?;
         let batch_size = context.session_config().batch_size();
 
+        let reservation = MemoryConsumer::new(format!("SemiAntiSMJStream[{partition}]"))
+            .register(context.memory_pool());
+        let peak_mem_used =
+            MetricBuilder::new(&self.metrics).gauge("peak_mem_used", partition);
+        let spill_manager = SpillManager::new(
+            context.runtime_env(),
+            SpillMetrics::new(&self.metrics, partition),
+            inner.schema(),
+        )
+        .with_compression_type(context.session_config().spill_compression());
+
         Ok(Box::pin(SemiAntiSortMergeJoinStream::try_new(
             Arc::clone(&self.schema),
             self.sort_options.clone(),
@@ -461,6 +478,10 @@ impl ExecutionPlan for SemiAntiSortMergeJoinExec {
             batch_size,
             partition,
             &self.metrics,
+            reservation,
+            peak_mem_used,
+            spill_manager,
+            context.runtime_env(),
         )?))
     }
 

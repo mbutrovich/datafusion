@@ -28,6 +28,8 @@ use crate::expressions::Column;
 use crate::joins::SortMergeJoinExec;
 use crate::joins::utils::{ColumnIndex, JoinFilter};
 use crate::metrics::ExecutionPlanMetricsSet;
+use crate::metrics::{MetricBuilder, SpillMetrics};
+use crate::spill::spill_manager::SpillManager;
 use crate::test::TestMemoryExec;
 
 use arrow::array::{Int32Array, RecordBatch};
@@ -37,6 +39,7 @@ use datafusion_common::JoinSide;
 use datafusion_common::JoinType::*;
 use datafusion_common::test_util::batches_to_sort_string;
 use datafusion_common::{NullEquality, Result};
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::BinaryExpr;
@@ -47,6 +50,28 @@ type JoinOn = Vec<(
     Arc<dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr>,
     Arc<dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr>,
 )>;
+
+/// Create test memory/spill resources for stream-level tests.
+fn test_stream_resources(
+    inner_schema: SchemaRef,
+    metrics: &ExecutionPlanMetricsSet,
+) -> (
+    datafusion_execution::memory_pool::MemoryReservation,
+    crate::metrics::Gauge,
+    SpillManager,
+    Arc<datafusion_execution::runtime_env::RuntimeEnv>,
+) {
+    let ctx = TaskContext::default();
+    let runtime_env = ctx.runtime_env();
+    let reservation = MemoryConsumer::new("test").register(ctx.memory_pool());
+    let peak_mem_used = MetricBuilder::new(metrics).gauge("peak_mem_used", 0);
+    let spill_manager = SpillManager::new(
+        Arc::clone(&runtime_env),
+        SpillMetrics::new(metrics, 0),
+        inner_schema,
+    );
+    (reservation, peak_mem_used, spill_manager, runtime_env)
+}
 
 fn build_table(
     a: (&str, &Vec<i32>),
@@ -1069,6 +1094,9 @@ async fn filter_buffer_pending_loses_inner_rows() -> Result<()> {
     let on_inner: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("b1", 1))];
 
     let metrics = ExecutionPlanMetricsSet::new();
+    let inner_schema = inner.schema();
+    let (reservation, peak_mem_used, spill_manager, runtime_env) =
+        test_stream_resources(inner_schema, &metrics);
     let stream = SemiAntiSortMergeJoinStream::try_new(
         left_schema, // output schema = outer schema for semi
         vec![SortOptions::default()],
@@ -1082,6 +1110,10 @@ async fn filter_buffer_pending_loses_inner_rows() -> Result<()> {
         8192,
         0,
         &metrics,
+        reservation,
+        peak_mem_used,
+        spill_manager,
+        runtime_env,
     )?;
 
     let batches = collect_stream(stream).await?;
@@ -1162,6 +1194,9 @@ async fn no_filter_boundary_pending_loses_outer_rows() -> Result<()> {
     let on_inner: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("b1", 1))];
 
     let metrics = ExecutionPlanMetricsSet::new();
+    let inner_schema = inner.schema();
+    let (reservation, peak_mem_used, spill_manager, runtime_env) =
+        test_stream_resources(inner_schema, &metrics);
     let stream = SemiAntiSortMergeJoinStream::try_new(
         left_schema,
         vec![SortOptions::default()],
@@ -1175,6 +1210,10 @@ async fn no_filter_boundary_pending_loses_outer_rows() -> Result<()> {
         8192,
         0,
         &metrics,
+        reservation,
+        peak_mem_used,
+        spill_manager,
+        runtime_env,
     )?;
 
     let batches = collect_stream(stream).await?;
@@ -1269,6 +1308,9 @@ async fn filtered_boundary_pending_outer_rows() -> Result<()> {
     let on_inner: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("b1", 1))];
 
     let metrics = ExecutionPlanMetricsSet::new();
+    let inner_schema = inner.schema();
+    let (reservation, peak_mem_used, spill_manager, runtime_env) =
+        test_stream_resources(inner_schema, &metrics);
     let stream = SemiAntiSortMergeJoinStream::try_new(
         left_schema,
         vec![SortOptions::default()],
@@ -1282,6 +1324,10 @@ async fn filtered_boundary_pending_outer_rows() -> Result<()> {
         8192,
         0,
         &metrics,
+        reservation,
+        peak_mem_used,
+        spill_manager,
+        runtime_env,
     )?;
 
     let batches = collect_stream(stream).await?;
@@ -1291,5 +1337,139 @@ async fn filtered_boundary_pending_outer_rows() -> Result<()> {
         "LeftSemi filtered boundary: only first outer row (c1=10) matches \
          filter c1==c2. Got {total} rows."
     );
+    Ok(())
+}
+
+// ==================== SPILL TESTS ====================
+
+/// Exercises inner key group spilling under memory pressure.
+///
+/// Uses a tiny memory limit (100 bytes) with disk spilling enabled. Since our
+/// operator only buffers inner rows when a filter is present, this test includes
+/// a filter (c1 < c2, always true). Verifies:
+/// 1. Spill metrics are recorded (spill_count, spilled_bytes, spilled_rows > 0)
+/// 2. Results match a non-spilled run
+#[tokio::test]
+async fn spill_with_filter() -> Result<()> {
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    let left = build_table(
+        ("a1", &vec![1, 2, 3, 4, 5, 6]),
+        ("b1", &vec![1, 2, 3, 4, 5, 6]),
+        ("c1", &vec![4, 5, 6, 7, 8, 9]),
+    );
+    let right = build_table(
+        ("a2", &vec![10, 20, 30, 40, 50]),
+        ("b1", &vec![1, 3, 4, 6, 8]),
+        ("c2", &vec![50, 60, 70, 80, 90]),
+    );
+    let on = vec![(
+        Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+        Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+    )];
+    let sort_options = vec![SortOptions::default(); on.len()];
+
+    // c1 < c2 is always true for matching keys
+    let filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c1", 0)),
+            Operator::Lt,
+            Arc::new(Column::new("c2", 1)),
+        )),
+        vec![
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Right,
+            },
+        ],
+        Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, false),
+            Field::new("c2", DataType::Int32, false),
+        ])),
+    );
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(100, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+        )
+        .build_arc()?;
+
+    for batch_size in [1, 50] {
+        let session_config = SessionConfig::default().with_batch_size(batch_size);
+
+        for join_type in [LeftSemi, LeftAnti, RightSemi, RightAnti] {
+            let task_ctx = Arc::new(
+                TaskContext::default()
+                    .with_session_config(session_config.clone())
+                    .with_runtime(Arc::clone(&runtime)),
+            );
+
+            let join = SemiAntiSortMergeJoinExec::try_new(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                Some(filter.clone()),
+                join_type,
+                sort_options.clone(),
+                NullEquality::NullEqualsNothing,
+            )?;
+            let stream = join.execute(0, task_ctx)?;
+            let spilled_result = common::collect(stream).await.unwrap();
+
+            assert!(
+                join.metrics().is_some(),
+                "metrics missing for {join_type:?}"
+            );
+            let metrics = join.metrics().unwrap();
+            assert!(
+                metrics.spill_count().unwrap() > 0,
+                "expected spill_count > 0 for {join_type:?}, batch_size={batch_size}"
+            );
+            assert!(
+                metrics.spilled_bytes().unwrap() > 0,
+                "expected spilled_bytes > 0 for {join_type:?}, batch_size={batch_size}"
+            );
+            assert!(
+                metrics.spilled_rows().unwrap() > 0,
+                "expected spilled_rows > 0 for {join_type:?}, batch_size={batch_size}"
+            );
+
+            // Run without spilling and compare results
+            let task_ctx_no_spill = Arc::new(
+                TaskContext::default().with_session_config(session_config.clone()),
+            );
+            let join_no_spill = SemiAntiSortMergeJoinExec::try_new(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                Some(filter.clone()),
+                join_type,
+                sort_options.clone(),
+                NullEquality::NullEqualsNothing,
+            )?;
+            let stream = join_no_spill.execute(0, task_ctx_no_spill)?;
+            let no_spill_result = common::collect(stream).await.unwrap();
+
+            let no_spill_metrics = join_no_spill.metrics().unwrap();
+            assert_eq!(
+                no_spill_metrics.spill_count(),
+                Some(0),
+                "unexpected spill for {join_type:?} without memory limit"
+            );
+
+            assert_eq!(
+                spilled_result, no_spill_result,
+                "spilled vs non-spilled results differ for {join_type:?}, batch_size={batch_size}"
+            );
+        }
+    }
+
     Ok(())
 }
