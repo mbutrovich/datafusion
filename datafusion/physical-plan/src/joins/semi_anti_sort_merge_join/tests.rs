@@ -1591,11 +1591,11 @@ async fn spill_filtered_boundary_loses_outer_rows() -> Result<()> {
         let spill_manager = SpillManager::new(
             Arc::clone(&runtime),
             SpillMetrics::new(&metrics, 0),
-            right_schema.clone(),
+            Arc::clone(&right_schema),
         );
 
         let stream = SemiAntiSortMergeJoinStream::try_new(
-            left_schema.clone(),
+            Arc::clone(&left_schema),
             vec![SortOptions::default()],
             NullEquality::NullEqualsNothing,
             outer,
