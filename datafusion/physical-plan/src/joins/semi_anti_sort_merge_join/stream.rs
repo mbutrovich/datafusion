@@ -141,22 +141,22 @@ fn find_key_group_end(
 /// re-entry: compare the new batch's first key with the saved key to
 /// decide whether to continue marking or move on.
 #[derive(Debug)]
-enum BoundaryState {
-    /// Normal processing — not inside a boundary poll.
-    Normal,
-    /// The no-filter boundary loop's `poll_next_outer_batch` returned
-    /// Pending. Carries the key arrays and index from the last emitted
-    /// batch so we can compare with the next batch's first key.
-    NoFilterPending {
+/// When a key group spans an outer batch boundary, we poll for the next
+/// outer batch. If that poll returns `Pending`, we must yield back to the
+/// executor — but we need to remember where we were so we can resume.
+/// This enum carries the last key from the previous batch so we can check
+/// whether the next batch continues the same key group.
+///
+/// Stored as `Option<PendingBoundary>`: `None` means normal processing.
+enum PendingBoundary {
+    /// Resuming a no-filter boundary loop.
+    NoFilter {
         saved_keys: Vec<ArrayRef>,
         saved_idx: usize,
     },
-    /// The filtered boundary loop's `poll_next_outer_batch` returned
-    /// Pending. Carries the key arrays and index from the last emitted
-    /// outer batch so we can compare with the next batch's first key
-    /// without reading from the inner key buffer (which may have been
-    /// spilled to disk).
-    FilteredPending {
+    /// Resuming a filtered boundary loop. Inner key data remains in the
+    /// buffer (or spill file) for the resumed loop.
+    Filtered {
         saved_keys: Vec<ArrayRef>,
         saved_idx: usize,
     },
@@ -199,8 +199,8 @@ pub(super) struct SemiAntiSortMergeJoinStream {
     // current inner_batch was already sliced and pushed before Pending).
     buffering_inner_pending: bool,
 
-    // Boundary re-entry state — see BoundaryState doc comment.
-    boundary_state: BoundaryState,
+    // Boundary re-entry state — see PendingBoundary doc comment.
+    pending_boundary: Option<PendingBoundary>,
 
     // Join condition
     on_outer: Vec<PhysicalExprRef>,
@@ -283,7 +283,7 @@ impl SemiAntiSortMergeJoinStream {
             inner_key_buffer: vec![],
             inner_key_spill: None,
             buffering_inner_pending: false,
-            boundary_state: BoundaryState::Normal,
+            pending_boundary: None,
             on_outer,
             on_inner,
             filter,
@@ -684,11 +684,11 @@ impl SemiAntiSortMergeJoinStream {
             self.outer_batch.is_some(),
             "caller must load outer_batch first"
         );
-        match std::mem::replace(&mut self.boundary_state, BoundaryState::Normal) {
-            BoundaryState::NoFilterPending {
+        match self.pending_boundary.take() {
+            Some(PendingBoundary::NoFilter {
                 saved_keys,
                 saved_idx,
-            } => {
+            }) => {
                 let same_key = keys_match(
                     &saved_keys,
                     saved_idx,
@@ -703,20 +703,20 @@ impl SemiAntiSortMergeJoinStream {
                     if self.outer_offset >= num_outer {
                         let new_saved = self.outer_key_arrays.clone();
                         let new_idx = num_outer - 1;
-                        self.boundary_state = BoundaryState::NoFilterPending {
+                        self.pending_boundary = Some(PendingBoundary::NoFilter {
                             saved_keys: new_saved,
                             saved_idx: new_idx,
-                        };
+                        });
                         self.emit_outer_batch()?;
                         self.outer_batch = None;
                         return Ok(true);
                     }
                 }
             }
-            BoundaryState::FilteredPending {
+            Some(PendingBoundary::Filtered {
                 saved_keys,
                 saved_idx,
-            } => {
+            }) => {
                 debug_assert!(
                     !self.inner_key_buffer.is_empty() || self.inner_key_spill.is_some(),
                     "FilteredPending entered but no inner key data exists"
@@ -735,10 +735,10 @@ impl SemiAntiSortMergeJoinStream {
                     if self.outer_offset >= num_outer {
                         let new_saved = self.outer_key_arrays.clone();
                         let new_idx = num_outer - 1;
-                        self.boundary_state = BoundaryState::FilteredPending {
+                        self.pending_boundary = Some(PendingBoundary::Filtered {
                             saved_keys: new_saved,
                             saved_idx: new_idx,
-                        };
+                        });
                         self.emit_outer_batch()?;
                         self.outer_batch = None;
                         return Ok(true);
@@ -746,7 +746,7 @@ impl SemiAntiSortMergeJoinStream {
                 }
                 self.clear_inner_key_group();
             }
-            BoundaryState::Normal => {}
+            None => {}
         }
         Ok(false)
     }
@@ -763,7 +763,7 @@ impl SemiAntiSortMergeJoinStream {
                     Err(e) => return Poll::Ready(Err(e)),
                     Ok(false) => {
                         // Outer exhausted — flush coalescer
-                        self.boundary_state = BoundaryState::Normal;
+                        self.pending_boundary = None;
                         self.coalescer.finish_buffered_batch()?;
                         if let Some(batch) = self.coalescer.next_completed_batch() {
                             return Poll::Ready(Ok(Some(batch)));
@@ -781,9 +781,7 @@ impl SemiAntiSortMergeJoinStream {
             // 2. Ensure we have an inner batch (unless inner is exhausted).
             // Skip this when in a boundary state — inner was already
             // advanced past the key group before the boundary loop started.
-            if self.inner_batch.is_none()
-                && matches!(self.boundary_state, BoundaryState::Normal)
-            {
+            if self.inner_batch.is_none() && self.pending_boundary.is_none() {
                 match ready!(self.poll_next_inner_batch(cx)) {
                     Err(e) => return Poll::Ready(Err(e)),
                     Ok(false) => {
@@ -932,26 +930,23 @@ impl SemiAntiSortMergeJoinStream {
                                         || self.inner_key_spill.is_some(),
                                     "FilteredPending requires inner key data in buffer or spill"
                                 );
-                                self.boundary_state = BoundaryState::FilteredPending {
+                                self.pending_boundary = Some(PendingBoundary::Filtered {
                                     saved_keys,
                                     saved_idx,
-                                };
+                                });
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
                                     Err(e) => return Poll::Ready(Err(e)),
                                     Ok(false) => {
-                                        self.boundary_state = BoundaryState::Normal;
+                                        self.pending_boundary = None;
                                         self.outer_batch = None;
                                         break;
                                     }
                                     Ok(true) => {
-                                        let BoundaryState::FilteredPending {
+                                        let Some(PendingBoundary::Filtered {
                                             saved_keys,
                                             saved_idx,
-                                        } = std::mem::replace(
-                                            &mut self.boundary_state,
-                                            BoundaryState::Normal,
-                                        )
+                                        }) = self.pending_boundary.take()
                                         else {
                                             unreachable!()
                                         };
@@ -992,31 +987,23 @@ impl SemiAntiSortMergeJoinStream {
                                 let saved_idx = num_outer - 1;
 
                                 self.emit_outer_batch()?;
-                                // Save boundary state before polling. If
-                                // poll returns Pending, poll_join exits and
-                                // re-enters from the top. The saved state
-                                // lets step 1 resume the boundary loop.
-                                self.boundary_state = BoundaryState::NoFilterPending {
+                                self.pending_boundary = Some(PendingBoundary::NoFilter {
                                     saved_keys,
                                     saved_idx,
-                                };
+                                });
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
                                     Err(e) => return Poll::Ready(Err(e)),
                                     Ok(false) => {
-                                        self.boundary_state = BoundaryState::Normal;
+                                        self.pending_boundary = None;
                                         self.outer_batch = None;
                                         break;
                                     }
                                     Ok(true) => {
-                                        // Recover saved_keys from boundary state
-                                        let BoundaryState::NoFilterPending {
+                                        let Some(PendingBoundary::NoFilter {
                                             saved_keys,
                                             saved_idx,
-                                        } = std::mem::replace(
-                                            &mut self.boundary_state,
-                                            BoundaryState::Normal,
-                                        )
+                                        }) = self.pending_boundary.take()
                                         else {
                                             unreachable!()
                                         };
