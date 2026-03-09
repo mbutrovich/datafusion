@@ -1473,3 +1473,167 @@ async fn spill_with_filter() -> Result<()> {
 
     Ok(())
 }
+
+/// Reproduces a bug where `resume_boundary` for the FilteredPending case
+/// only checks `inner_key_buffer.is_empty()` but ignores `inner_key_spill`.
+/// After spilling, the in-memory buffer is cleared while the spill file
+/// holds the data. If the outer key group spans a batch boundary, the
+/// second outer batch's rows are never evaluated against the inner group.
+///
+/// Setup:
+/// - Outer: 2 single-row batches, both key=1, c1=[10, 10]
+/// - Inner: 1 batch with many rows all key=1 (enough to trigger spill)
+/// - Filter: c1 == c2 (matches when c2=10)
+/// - Memory limit: tiny (100 bytes) to force spilling
+/// - Pending before 2nd outer batch to trigger boundary re-entry
+///
+/// Expected: both outer rows match (semi=2 rows, anti=0 rows)
+/// Bug: second outer row is skipped because resume_boundary sees empty
+///      inner_key_buffer and skips re-evaluation.
+#[tokio::test]
+async fn spill_filtered_boundary_loses_outer_rows() -> Result<()> {
+    use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("a1", DataType::Int32, false),
+        Field::new("b1", DataType::Int32, false),
+        Field::new("c1", DataType::Int32, false),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("a2", DataType::Int32, false),
+        Field::new("b1", DataType::Int32, false),
+        Field::new("c2", DataType::Int32, false),
+    ]));
+
+    // Two single-row outer batches with the same key — key group spans boundary
+    let outer_batch1 = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![1])), // key=1
+            Arc::new(Int32Array::from(vec![10])), // matches filter
+        ],
+    )?;
+    let outer_batch2 = RecordBatch::try_new(
+        Arc::clone(&left_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![1])), // same key=1
+            Arc::new(Int32Array::from(vec![10])), // also matches filter
+        ],
+    )?;
+
+    // Inner: many rows with key=1 to force spilling, followed by key=2.
+    // c2=10 so the filter c1==c2 passes for both outer rows.
+    // The key=2 row ensures the inner cursor advances past the key group
+    // (buffer_inner_key_group returns Ok(false) instead of Ok(true)).
+    let n_inner = 200;
+    let mut inner_a = vec![100; n_inner];
+    inner_a.push(101);
+    let mut inner_b = vec![1; n_inner];
+    inner_b.push(2); // different key — forces inner cursor past key=1
+    let mut inner_c = vec![10; n_inner];
+    inner_c.push(10);
+    let inner_batch = RecordBatch::try_new(
+        Arc::clone(&right_schema),
+        vec![
+            Arc::new(Int32Array::from(inner_a)),
+            Arc::new(Int32Array::from(inner_b)),
+            Arc::new(Int32Array::from(inner_c)),
+        ],
+    )?;
+
+    // Filter: c1 == c2
+    let filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("c1", 0)),
+            Operator::Eq,
+            Arc::new(Column::new("c2", 1)),
+        )),
+        vec![
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Right,
+            },
+        ],
+        Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, false),
+            Field::new("c2", DataType::Int32, false),
+        ])),
+    );
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(100, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory),
+        )
+        .build_arc()?;
+
+    let on_outer: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("b1", 1))];
+    let on_inner: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("b1", 1))];
+
+    for join_type in [LeftSemi, LeftAnti] {
+        let outer: SendableRecordBatchStream = Box::pin(PendingStream::new(
+            vec![outer_batch1.clone(), outer_batch2.clone()],
+            vec![false, true], // Pending before 2nd outer batch
+        ));
+        let inner: SendableRecordBatchStream =
+            Box::pin(PendingStream::new(vec![inner_batch.clone()], vec![false]));
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let reservation = MemoryConsumer::new("test").register(&runtime.memory_pool);
+        let peak_mem_used = MetricBuilder::new(&metrics).gauge("peak_mem_used", 0);
+        let spill_manager = SpillManager::new(
+            Arc::clone(&runtime),
+            SpillMetrics::new(&metrics, 0),
+            right_schema.clone(),
+        );
+
+        let stream = SemiAntiSortMergeJoinStream::try_new(
+            left_schema.clone(),
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+            outer,
+            inner,
+            on_outer.clone(),
+            on_inner.clone(),
+            Some(filter.clone()),
+            join_type,
+            8192,
+            0,
+            &metrics,
+            reservation,
+            peak_mem_used,
+            spill_manager,
+            Arc::clone(&runtime),
+        )?;
+
+        let batches = collect_stream(stream).await?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        match join_type {
+            LeftSemi => {
+                assert_eq!(
+                    total, 2,
+                    "LeftSemi spill+boundary: both outer rows match filter, \
+                     expected 2 rows, got {total}"
+                );
+            }
+            LeftAnti => {
+                assert_eq!(
+                    total, 0,
+                    "LeftAnti spill+boundary: both outer rows match filter, \
+                     expected 0 rows, got {total}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}

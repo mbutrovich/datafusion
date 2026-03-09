@@ -709,6 +709,10 @@ impl SemiAntiSortMergeJoinStream {
                 }
             }
             BoundaryState::FilteredPending => {
+                debug_assert!(
+                    !self.inner_key_buffer.is_empty() || self.inner_key_spill.is_some(),
+                    "FilteredPending requires inner key data in buffer or spill"
+                );
                 if !self.inner_key_buffer.is_empty() {
                     let first_inner = &self.inner_key_buffer[0];
                     let inner_keys = evaluate_join_keys(first_inner, &self.on_inner)?;
@@ -724,6 +728,11 @@ impl SemiAntiSortMergeJoinStream {
                         self.process_key_match_with_filter()?;
                         let num_outer = self.outer_batch.as_ref().unwrap().num_rows();
                         if self.outer_offset >= num_outer {
+                            debug_assert!(
+                                !self.inner_key_buffer.is_empty()
+                                    || self.inner_key_spill.is_some(),
+                                "FilteredPending requires inner key data in buffer or spill"
+                            );
                             self.boundary_state = BoundaryState::FilteredPending;
                             self.emit_outer_batch()?;
                             self.outer_batch = None;
@@ -911,6 +920,11 @@ impl SemiAntiSortMergeJoinStream {
                             let outer_batch = self.outer_batch.as_ref().unwrap();
                             if self.outer_offset >= outer_batch.num_rows() {
                                 self.emit_outer_batch()?;
+                                debug_assert!(
+                                    !self.inner_key_buffer.is_empty()
+                                        || self.inner_key_spill.is_some(),
+                                    "FilteredPending requires inner key data in buffer or spill"
+                                );
                                 self.boundary_state = BoundaryState::FilteredPending;
 
                                 match ready!(self.poll_next_outer_batch(cx)) {
