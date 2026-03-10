@@ -15,7 +15,105 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stream implementation for semi/anti sort-merge joins.
+//! Sort-merge join stream specialized for semi/anti joins.
+//!
+//! Instantiated by [`SortMergeJoinExec`](crate::joins::sort_merge_join::SortMergeJoinExec)
+//! when the join type is `LeftSemi`, `LeftAnti`, `RightSemi`, or `RightAnti`.
+//!
+//! # Motivation
+//!
+//! The general-purpose [`SortMergeJoinStream`](crate::joins::sort_merge_join::SortMergeJoinStream)
+//! handles semi/anti joins by materializing `(outer, inner)` row pairs,
+//! applying a filter, then using a "corrected filter mask" to deduplicate.
+//! Semi/anti joins only need a boolean per outer row (does a match exist?),
+//! not pairs. The pair-based approach incurs unnecessary memory allocation
+//! and intermediate batches.
+//!
+//! This stream instead tracks matches with a per-outer-batch bitset,
+//! avoiding all pair materialization.
+//!
+//! # "Outer Side" vs "Inner Side"
+//!
+//! For `Left*` join types, left is outer and right is inner.
+//! For `Right*` join types, right is outer and left is inner.
+//! The output schema always equals the outer side's schema.
+//!
+//! # Algorithm
+//!
+//! Both inputs must be sorted by the join keys. The stream performs a merge
+//! scan across the two sorted inputs:
+//!
+//! ```text
+//!   outer cursor ──►  [1, 2, 2, 3, 5, 5, 7]
+//!   inner cursor ──►  [2, 2, 4, 5, 6, 7, 7]
+//!                       ▲
+//!                   compare keys at cursors
+//! ```
+//!
+//! At each step, the keys at the outer and inner cursors are compared:
+//!
+//! - **outer < inner**: Skip the outer key group (no match exists).
+//! - **outer > inner**: Skip the inner key group.
+//! - **outer == inner**: Process the match (see below).
+//!
+//! Key groups are contiguous runs of equal keys within one side. The scan
+//! advances past entire groups at each step.
+//!
+//! ## Processing a key match
+//!
+//! **Without filter**: All outer rows in the key group are marked as matched.
+//!
+//! **With filter**: The inner key group is buffered (may span multiple inner
+//! batches). For each buffered inner row, the filter is evaluated against the
+//! outer key group as a batch. Results are OR'd into the matched bitset. A
+//! short-circuit exits early when all outer rows in the group are matched.
+//!
+//! ```text
+//!   matched bitset:  [0, 0, 1, 0, 0, ...]
+//!                     ▲── one bit per outer row ──▲
+//!
+//!   On emit:
+//!     Semi  → filter_record_batch(outer_batch, &matched)
+//!     Anti  → filter_record_batch(outer_batch, &NOT(matched))
+//! ```
+//!
+//! ## Batch boundaries
+//!
+//! Key groups can span batch boundaries on either side. The stream handles
+//! this by detecting when a group extends to the end of a batch, loading the
+//! next batch, and continuing if the key matches. The [`PendingBoundary`] enum
+//! preserves loop context across async `Poll::Pending` re-entries.
+//!
+//! # Memory
+//!
+//! Memory usage is bounded and independent of total input size:
+//! - One outer batch at a time (not tracked by reservation — single batch,
+//!   cannot be spilled since it's needed for filter evaluation)
+//! - One inner batch at a time (streaming)
+//! - `matched` bitset: one bit per outer row, re-allocated per batch
+//! - Inner key group buffer: only for filtered joins, one key group at a time.
+//!   Tracked via `MemoryReservation`; spilled to disk when the memory pool
+//!   limit is exceeded.
+//! - `BatchCoalescer`: output buffering to target batch size
+//!
+//! # Degenerate cases
+//!
+//! **Highly skewed key (filtered joins only):** When a filter is present,
+//! the inner key group is buffered so each inner row can be evaluated
+//! against the outer group. If one join key has N inner rows, all N rows
+//! are held in memory simultaneously (or spilled to disk if the memory
+//! pool limit is reached). With uniform key distribution this is small
+//! (inner_rows / num_distinct_keys), but a single hot key can buffer
+//! arbitrarily many rows. The no-filter path does not buffer inner
+//! rows — it only advances the cursor — so it is unaffected.
+//!
+//! **Scalar broadcast during filter evaluation:** Each inner row is
+//! broadcast to match the outer group length for filter evaluation,
+//! allocating one array per inner row × filter column. This is inherent
+//! to the `PhysicalExpr::evaluate(RecordBatch)` API, which does not
+//! support scalar inputs directly. The total work is
+//! O(inner_group × outer_group) per key, but with much lower constant
+//! factor than the pair-materialization approach.
 
 use std::cmp::Ordering;
 use std::fs::File;
