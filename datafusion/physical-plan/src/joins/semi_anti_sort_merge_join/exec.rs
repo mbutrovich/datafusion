@@ -489,13 +489,16 @@ impl ExecutionPlan for SemiAntiSortMergeJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        estimate_join_statistics(
-            self.left.partition_statistics(partition)?,
-            self.right.partition_statistics(partition)?,
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let left_stats = Arc::unwrap_or_clone(self.left.partition_statistics(partition)?);
+        let right_stats =
+            Arc::unwrap_or_clone(self.right.partition_statistics(partition)?);
+        Ok(Arc::new(estimate_join_statistics(
+            left_stats,
+            right_stats,
             &self.on,
             &self.join_type,
             &self.schema,
-        )
+        )?))
     }
 }
