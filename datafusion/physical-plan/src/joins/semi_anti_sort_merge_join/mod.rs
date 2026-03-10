@@ -15,14 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Specialized Sort Merge Join for Semi/Anti joins.
+//! Specialized Sort Merge Join stream for Semi/Anti joins.
 //!
-//! See [`SemiAntiSortMergeJoinExec`] for algorithm details and motivation.
+//! Used internally by `SortMergeJoinExec` for semi/anti join types.
 
-pub use exec::SemiAntiSortMergeJoinExec;
-
-mod exec;
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(test)]
 mod tests;

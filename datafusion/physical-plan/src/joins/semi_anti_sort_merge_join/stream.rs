@@ -147,7 +147,7 @@ enum PendingBoundary {
     Filtered { saved_keys: Vec<ArrayRef> },
 }
 
-pub(super) struct SemiAntiSortMergeJoinStream {
+pub(crate) struct SemiAntiSortMergeJoinStream {
     /// true for semi (emit matched), false for anti (emit unmatched)
     is_semi: bool,
 
