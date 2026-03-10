@@ -249,8 +249,11 @@ pub(crate) struct SemiAntiSortMergeJoinStream {
     /// true for semi (emit matched), false for anti (emit unmatched)
     is_semi: bool,
 
-    // Input streams — "outer" is the streamed side whose rows we output,
-    // "inner" is the buffered side we match against.
+    // Input streams — in the nested-loop model that sort-merge join
+    // implements, "outer" is the driving loop and "inner" is probed for
+    // matches. The existing SortMergeJoinStream calls these "streamed"
+    // and "buffered" respectively. For Left* joins, outer=left; for
+    // Right* joins, outer=right. Output schema equals the outer side.
     outer: SendableRecordBatchStream,
     inner: SendableRecordBatchStream,
 
