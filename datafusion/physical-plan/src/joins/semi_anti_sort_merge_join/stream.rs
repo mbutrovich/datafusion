@@ -22,7 +22,7 @@
 //!
 //! # Motivation
 //!
-//! The general-purpose [`SortMergeJoinStream`](crate::joins::sort_merge_join::SortMergeJoinStream)
+//! The general-purpose `SortMergeJoinStream`
 //! handles semi/anti joins by materializing `(outer, inner)` row pairs,
 //! applying a filter, then using a "corrected filter mask" to deduplicate.
 //! Semi/anti joins only need a boolean per outer row (does a match exist?),
