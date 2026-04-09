@@ -299,6 +299,7 @@ pub(crate) struct IncrementalSortIterator {
     batch: RecordBatch,
     expressions: LexOrdering,
     batch_size: usize,
+    use_radix: bool,
     indices: Option<UInt32Array>,
     cursor: usize,
 }
@@ -308,11 +309,13 @@ impl IncrementalSortIterator {
         batch: RecordBatch,
         expressions: LexOrdering,
         batch_size: usize,
+        use_radix: bool,
     ) -> Self {
         Self {
             batch,
             expressions,
             batch_size,
+            use_radix,
             cursor: 0,
             indices: None,
         }
@@ -339,7 +342,12 @@ impl Iterator for IncrementalSortIterator {
                     Err(e) => return Some(Err(e)),
                 };
 
-                let indices = match lexsort_to_indices(&sort_columns, None) {
+                let indices = if self.use_radix {
+                    super::radix::radix_sort_to_indices(&sort_columns)
+                } else {
+                    lexsort_to_indices(&sort_columns, None)
+                };
+                let indices = match indices {
                     Ok(indices) => indices,
                     Err(e) => return Some(Err(e.into())),
                 };
@@ -414,7 +422,7 @@ mod tests {
         .unwrap();
 
         let mut total_rows = 0;
-        IncrementalSortIterator::new(batch.clone(), expressions, batch_size).try_for_each(
+        IncrementalSortIterator::new(batch.clone(), expressions, batch_size, false).try_for_each(
             |result| {
                 let chunk = result?;
                 total_rows += chunk.num_rows();

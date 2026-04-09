@@ -55,7 +55,7 @@ use crate::{
 
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -220,6 +220,8 @@ struct ExternalSorter {
     /// the data will be concatenated and sorted in place rather than
     /// sort/merged.
     sort_in_place_threshold_bytes: usize,
+    /// Whether to use radix sort (decided once from expression types).
+    use_radix: bool,
 
     // ========================================================================
     // STATE BUFFERS:
@@ -294,6 +296,12 @@ impl ExternalSorter {
         )
         .with_compression_type(spill_compression);
 
+        let sort_data_types: Vec<DataType> = expr
+            .iter()
+            .map(|e| e.expr.data_type(&schema))
+            .collect::<Result<_>>()?;
+        let use_radix = use_radix_sort(&sort_data_types.iter().collect::<Vec<_>>());
+
         Ok(Self {
             schema,
             in_mem_batches: vec![],
@@ -308,6 +316,7 @@ impl ExternalSorter {
             batch_size,
             sort_spill_reservation_bytes,
             sort_in_place_threshold_bytes,
+            use_radix,
         })
     }
 
@@ -735,13 +744,15 @@ impl ExternalSorter {
         let schema = batch.schema();
         let expressions = self.expr.clone();
         let batch_size = self.batch_size;
+        let use_radix = self.use_radix;
         let output_row_metrics = metrics.output_rows().clone();
 
         let stream = futures::stream::once(async move {
             let schema = batch.schema();
 
             // Sort the batch immediately and get all output batches
-            let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
+            let sorted_batches =
+                sort_batch_chunked(&batch, &expressions, batch_size, use_radix)?;
 
             // Resize the reservation to match the actual sorted output size.
             // Using try_resize avoids a release-then-reacquire cycle, which
@@ -886,6 +897,24 @@ pub fn sort_batch(
         .map(|expr| expr.evaluate_to_sort_column(batch))
         .collect::<Result<Vec<_>>>()?;
 
+    if fetch.is_none()
+        && use_radix_sort(
+            &sort_columns
+                .iter()
+                .map(|c| c.values.data_type())
+                .collect::<Vec<_>>(),
+        )
+    {
+        let indices = super::radix::radix_sort_to_indices(&sort_columns)?;
+        let columns = take_arrays(batch.columns(), &indices, None)?;
+        let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
+        return Ok(RecordBatch::try_new_with_options(
+            batch.schema(),
+            columns,
+            &options,
+        )?);
+    }
+
     let indices = lexsort_to_indices(&sort_columns, fetch)?;
     let columns = take_arrays(batch.columns(), &indices, None)?;
 
@@ -897,6 +926,36 @@ pub fn sort_batch(
     )?)
 }
 
+/// Returns true if radix sort should be used for the given sort column types.
+///
+/// Radix sort is faster for most multi-column sorts but falls back to
+/// lexsort when:
+/// - All sort columns are dictionary-typed (long shared row prefixes
+///   waste radix passes before falling back to comparison sort)
+/// - Any sort column is a nested type (encoding cost is high and lexsort
+///   short-circuits comparison on leading columns)
+pub(super) fn use_radix_sort(data_types: &[&DataType]) -> bool {
+    if data_types.is_empty() {
+        return false;
+    }
+
+    let mut all_dict = true;
+    for dt in data_types {
+        match dt {
+            DataType::Dictionary(_, _) => {}
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _) => return false,
+            _ => all_dict = false,
+        }
+    }
+
+    !all_dict
+}
+
 /// Sort a batch and return the result as multiple batches of size `batch_size`.
 /// This is useful when you want to avoid creating one large sorted batch in memory,
 /// and instead want to process the sorted data in smaller chunks.
@@ -904,8 +963,15 @@ pub fn sort_batch_chunked(
     batch: &RecordBatch,
     expressions: &LexOrdering,
     batch_size: usize,
+    use_radix: bool,
 ) -> Result<Vec<RecordBatch>> {
-    IncrementalSortIterator::new(batch.clone(), expressions.clone(), batch_size).collect()
+    IncrementalSortIterator::new(
+        batch.clone(),
+        expressions.clone(),
+        batch_size,
+        use_radix,
+    )
+    .collect()
 }
 
 /// Sort execution plan.
@@ -2594,7 +2660,7 @@ mod tests {
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
         // Sort with batch_size = 250
-        let result_batches = sort_batch_chunked(&batch, &expressions, 250)?;
+        let result_batches = sort_batch_chunked(&batch, &expressions, 250, false)?;
 
         // Verify 4 batches are returned
         assert_eq!(result_batches.len(), 4);
@@ -2647,7 +2713,7 @@ mod tests {
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
         // Sort with batch_size = 100
-        let result_batches = sort_batch_chunked(&batch, &expressions, 100)?;
+        let result_batches = sort_batch_chunked(&batch, &expressions, 100, false)?;
 
         // Should return exactly 1 batch
         assert_eq!(result_batches.len(), 1);
@@ -2679,7 +2745,7 @@ mod tests {
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
         // Sort with batch_size = 100
-        let result_batches = sort_batch_chunked(&batch, &expressions, 100)?;
+        let result_batches = sort_batch_chunked(&batch, &expressions, 100, false)?;
 
         // Should return exactly 10 batches of 100 rows each
         assert_eq!(result_batches.len(), 10);
@@ -2706,7 +2772,7 @@ mod tests {
         let expressions: LexOrdering =
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
-        let result_batches = sort_batch_chunked(&batch, &expressions, 100)?;
+        let result_batches = sort_batch_chunked(&batch, &expressions, 100, false)?;
 
         // Empty input produces no output batches (0 chunks)
         assert_eq!(result_batches.len(), 0);
@@ -2928,5 +2994,192 @@ mod tests {
         // But the TopK self-filter should be pushed down.
         assert_eq!(desc.self_filters()[0].len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn test_sort_batch_radix_multi_column() {
+        let a1: ArrayRef = Arc::new(Int32Array::from(vec![2, 1, 2, 1]));
+        let a2: ArrayRef = Arc::new(Int32Array::from(vec![4, 3, 2, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![a1, a2]).unwrap();
+
+        let expressions = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new("b", 1))),
+        ])
+        .unwrap();
+
+        // No fetch -> should take the radix path
+        let sorted = sort_batch(&batch, &expressions, None).unwrap();
+        let col_a = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col_b = sorted
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_a.values(), &[1, 1, 2, 2]);
+        assert_eq!(col_b.values(), &[1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn test_sort_batch_lexsort_with_fetch() {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![5, 3, 1, 4, 2]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![a]).unwrap();
+
+        let expressions = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            Arc::new(Column::new("a", 0)),
+        )])
+        .unwrap();
+
+        // With fetch -> should use lexsort path
+        let sorted = sort_batch(&batch, &expressions, Some(2)).unwrap();
+        assert_eq!(sorted.num_rows(), 2);
+        let col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_use_radix_sort_heuristic() {
+        // Primitive columns -> radix
+        assert!(use_radix_sort(&[&DataType::Int32]));
+
+        // All dictionary -> lexsort
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(!use_radix_sort(&[&dict_type]));
+
+        // List column -> lexsort
+        let list_type =
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        assert!(!use_radix_sort(&[&list_type]));
+
+        // Mixed dict + primitive -> radix
+        assert!(use_radix_sort(&[&dict_type, &DataType::Int32]));
+
+        // Empty -> no radix
+        assert!(!use_radix_sort(&[]));
+    }
+
+    #[test]
+    fn test_sort_batch_radix_with_nulls_and_options() {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(3),
+            None,
+            Some(1),
+            None,
+            Some(2),
+        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(schema, vec![a]).unwrap();
+
+        // Descending, nulls first
+        let expressions = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("a", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        )])
+        .unwrap();
+
+        let sorted = sort_batch(&batch, &expressions, None).unwrap();
+        let col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // nulls first, then descending: NULL, NULL, 3, 2, 1
+        assert!(col.is_null(0));
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), 3);
+        assert_eq!(col.value(3), 2);
+        assert_eq!(col.value(4), 1);
+    }
+
+    #[test]
+    fn test_sort_batch_radix_matches_lexsort() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xCAFE);
+
+        for _ in 0..50 {
+            let len = rng.random_range(10..500);
+            let a1: ArrayRef = Arc::new(Int32Array::from(
+                (0..len)
+                    .map(|_| {
+                        if rng.random_bool(0.1) {
+                            None
+                        } else {
+                            Some(rng.random_range(-100..100))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let a2: ArrayRef = Arc::new(StringArray::from(
+                (0..len)
+                    .map(|_| {
+                        if rng.random_bool(0.1) {
+                            None
+                        } else {
+                            Some(
+                                ["alpha", "beta", "gamma", "delta", "epsilon"]
+                                    [rng.random_range(0..5)],
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![a1, a2]).unwrap();
+
+            let desc = rng.random_bool(0.5);
+            let nf = rng.random_bool(0.5);
+            let opts = SortOptions {
+                descending: desc,
+                nulls_first: nf,
+            };
+            let expressions = LexOrdering::new(vec![
+                PhysicalSortExpr::new(Arc::new(Column::new("a", 0)), opts),
+                PhysicalSortExpr::new(Arc::new(Column::new("b", 1)), opts),
+            ])
+            .unwrap();
+
+            // fetch=Some(len) forces the lexsort path while returning all rows
+            let lexsort_result =
+                sort_batch(&batch, &expressions, Some(len as usize)).unwrap();
+            // fetch=None takes the radix path for these column types
+            let radix_result = sort_batch(&batch, &expressions, None).unwrap();
+
+            assert_eq!(
+                radix_result.num_rows(),
+                lexsort_result.num_rows(),
+                "row count mismatch"
+            );
+
+            for col_idx in 0..batch.num_columns() {
+                assert_eq!(
+                    radix_result.column(col_idx).as_ref(),
+                    lexsort_result.column(col_idx).as_ref(),
+                    "column {col_idx} mismatch"
+                );
+            }
+        }
     }
 }

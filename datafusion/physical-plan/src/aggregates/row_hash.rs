@@ -1162,6 +1162,7 @@ impl GroupedHashAggregateStream {
             emit,
             self.spill_state.spill_expr.clone(),
             self.batch_size,
+            false,
         );
         let spillfile = self
             .spill_state
