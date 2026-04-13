@@ -314,9 +314,7 @@ async fn sort_spill_reservation() {
     // With low reservation, the sort should still succeed because
     // the chunked sort pipeline eagerly sorts and the multi-level merge
     // handles low merge memory by reducing fan-in.
-    let config = base_config
-        .clone()
-        .with_sort_spill_reservation_bytes(1024);
+    let config = base_config.clone().with_sort_spill_reservation_bytes(1024);
 
     test.clone()
         .with_expected_success()

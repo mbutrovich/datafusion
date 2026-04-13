@@ -531,7 +531,27 @@ impl ExternalSorter {
             self.merge_reservation.size()
         );
 
-        if self.spilled_before() {
+        // Determine if we must take the spill path.
+        //
+        // We must spill if:
+        // 1. We already spilled during the insert phase, OR
+        // 2. We have multiple sorted runs but merge_reservation is 0.
+        //
+        // Case 2 matters because the in-memory merge needs to allocate
+        // cursor infrastructure (RowCursorStream / FieldCursorStream)
+        // at build time, before any run data is consumed. The cursor
+        // allocation comes from merge_reservation. If that's 0, the
+        // pool is fully occupied by sorted run data and the cursor
+        // can't allocate. Spilling to disk frees pool memory, and
+        // MultiLevelMerge handles the merge with dynamic fan-in —
+        // reading from spill files that don't hold pool memory.
+        let must_spill = self.spilled_before()
+            || (self.sorted_runs.len() > 1 && self.merge_reservation.size() == 0);
+
+        if must_spill {
+            // Merge and spill remaining sorted runs first. If there are many
+            // sorted runs and the memory limit is almost reached, merging
+            // them with the spilled files at the same time might cause OOM.
             if self.has_sorted_runs() {
                 self.spill_sorted_runs().await?;
             }
@@ -554,6 +574,13 @@ impl ExternalSorter {
                 .with_reservation(self.merge_reservation.take())
                 .build()
         } else {
+            // In-memory path: we have 0 runs, 1 run (no merge needed),
+            // or multiple runs with merge_reservation > 0 providing
+            // headroom for cursor allocation.
+            //
+            // Release merge_reservation back to the pool — in the
+            // non-spill path, merge_sorted_runs allocates cursor memory
+            // from the pool directly (freed merge_reservation bytes).
             self.merge_reservation.free();
             self.merge_sorted_runs(self.metrics.baseline.clone())
         }
@@ -711,70 +738,43 @@ impl ExternalSorter {
         Ok(())
     }
 
-    /// Merges the pre-sorted runs and writes the result to spill files.
+    /// Spills sorted runs to disk.
+    ///
+    /// Unlike the old pipeline where `in_mem_batches` held unsorted data
+    /// that required merging before spilling, our sorted runs are already
+    /// sorted. We can spill each run directly as its own spill file.
+    /// MultiLevelMerge handles the fan-in during the final merge.
+    ///
+    /// This also avoids the need to allocate merge cursor infrastructure
+    /// (RowCursorStream / FieldCursorStream) during the spill, which is
+    /// important when the pool has no headroom (sort_spill_reservation_bytes=0).
     async fn spill_sorted_runs(&mut self) -> Result<()> {
         assert_or_internal_err!(
             self.has_sorted_runs(),
             "sorted_runs must not be empty when attempting to spill"
         );
 
-        // Release the memory reserved for merge back to the pool so
-        // there is some left when `merge_sorted_runs` requests an
-        // allocation. At the end of this function, memory will be
-        // reserved again for the next spill.
-        self.merge_reservation.free();
-
-        let mut sorted_stream =
-            self.merge_sorted_runs(self.metrics.baseline.intermediate())?;
-        // After `merge_sorted_runs()` is constructed, all `sorted_runs` are taken
-        // to construct a globally sorted stream.
-        assert_or_internal_err!(
-            self.sorted_runs.is_empty(),
-            "sorted_runs should be empty after constructing sorted stream"
+        eprintln!(
+            "[SORT] spill_sorted_runs: spilling {} runs individually",
+            self.sorted_runs.len()
         );
-        // 'global' here refers to all buffered batches when the memory limit is
-        // reached. This variable will buffer the sorted batches after
-        // sort-preserving merge and incrementally append to spill files.
-        let mut globally_sorted_batches: Vec<RecordBatch> = vec![];
 
-        while let Some(batch) = sorted_stream.next().await {
-            let batch = batch?;
-            let sorted_size = get_reserved_bytes_for_record_batch(&batch)?;
-            if self.reservation.try_grow(sorted_size).is_err() {
-                // Although the reservation is not enough, the batch is
-                // already in memory, so it's okay to combine it with previously
-                // sorted batches, and spill together.
-                globally_sorted_batches.push(batch);
-                self.consume_and_spill_append(&mut globally_sorted_batches)
-                    .await?; // reservation is freed in spill()
-            } else {
-                globally_sorted_batches.push(batch);
-            }
+        let all_runs = std::mem::take(&mut self.sorted_runs);
+        for run in all_runs {
+            let mut batches = run;
+            Self::organize_stringview_arrays(&mut batches)?;
+            self.consume_and_spill_append(&mut batches).await?;
+            self.spill_finish().await?;
         }
 
-        // Drop early to free up memory reserved by the sorted stream, otherwise the
-        // upcoming `self.reserve_memory_for_merge()` may fail due to insufficient memory.
-        drop(sorted_stream);
-
-        self.consume_and_spill_append(&mut globally_sorted_batches)
-            .await?;
-        self.spill_finish().await?;
-
-        // Sanity check after spilling
-        let buffers_cleared_property =
-            self.sorted_runs.is_empty() && globally_sorted_batches.is_empty();
-        assert_or_internal_err!(
-            buffers_cleared_property,
-            "sorted_runs and globally_sorted_batches should be cleared before"
-        );
-
-        // Reserve headroom for next sort/merge
         eprintln!(
             "[SORT] spill_sorted_runs end: reservation={}, merge_reservation={}, about to re-reserve {}",
             self.reservation.size(),
             self.merge_reservation.size(),
             self.sort_spill_reservation_bytes
         );
+
+        // Reserve headroom for next sort/merge
         self.reserve_memory_for_merge()?;
 
         Ok(())
@@ -835,10 +835,17 @@ impl ExternalSorter {
         }
 
         // Multiple runs: create one stream per run and merge.
-        // The merge stream holds the main reservation and frees memory
-        // as runs are consumed. This ensures the RowCursorStream can
-        // allocate for row encoding from the freed memory.
-        let reservation_for_merge = self.reservation.take();
+        //
+        // Memory model for the multi-run merge:
+        // - self.reservation holds the sorted run data. It stays allocated
+        //   for the lifetime of the ExternalSorter (freed on drop). This
+        //   over-reserves as runs are consumed, but is conservative/safe.
+        // - The merge cursor (RowCursorStream/FieldCursorStream) allocates
+        //   from a new_empty() reservation, drawing from pool headroom
+        //   freed by merge_reservation.free() in the caller.
+        // - This works because sort() only enters this path when
+        //   merge_reservation > 0, guaranteeing pool headroom for cursors.
+        //   When merge_reservation == 0, sort() takes the spill path instead.
         let streams = all_runs
             .into_iter()
             .map(|run| {
@@ -861,15 +868,21 @@ impl ExternalSorter {
             })
             .collect::<Result<_>>()?;
 
-        StreamingMergeBuilder::new()
+        let result = StreamingMergeBuilder::new()
             .with_streams(streams)
             .with_schema(Arc::clone(&self.schema))
             .with_expressions(&self.expr.clone())
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(None)
-            .with_reservation(reservation_for_merge)
-            .build()
+            .with_reservation(self.reservation.new_empty())
+            .build();
+
+        if let Err(ref e) = result {
+            eprintln!("[SORT] merge_sorted_runs build failed: {e}");
+        }
+
+        result
     }
 
     /// If this sort may spill, pre-allocates
