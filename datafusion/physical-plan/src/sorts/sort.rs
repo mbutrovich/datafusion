@@ -93,115 +93,82 @@ impl ExternalSorterMetrics {
 ///
 /// # Algorithm
 ///
-/// 1. get a non-empty new batch from input
+/// Incoming batches are coalesced via [`BatchCoalescer`] to a target
+/// row count before sorting. For radix-eligible schemas (primitives,
+/// strings) the target is `sort_coalesce_target_rows` (default 32768);
+/// for non-radix schemas (all-dictionary, nested types) it falls back
+/// to `batch_size`. This gives sort kernels enough rows to amortize
+/// overhead — radix sort is 2-3x faster than lexsort at 32K+ rows
+/// but slower at small batch sizes.
 ///
-/// 2. check with the memory manager there is sufficient space to
-///    buffer the batch in memory.
+/// Each coalesced batch is sorted immediately (radix or lexsort) and
+/// stored as a pre-sorted run. Under memory pressure the coalescer
+/// flushes early, producing smaller runs that fall back to lexsort.
 ///
-/// 2.1 if memory is sufficient, buffer batch in memory, go to 1.
+/// 1. For each incoming batch:
+///    - Reserve memory (2x batch size). If reservation fails, flush
+///      the coalescer, spill all sorted runs to disk, then retry.
+///    - Push batch into the coalescer.
+///    - If the coalescer reached its target: sort the coalesced batch
+///      and store as a new sorted run.
 ///
-/// 2.2 if no more memory is available, sort all buffered batches and
-///     spill to file.  buffer the next batch in memory, go to 1.
-///
-/// 3. when input is exhausted, merge all in memory batches and spills
-///    to get a total order.
+/// 2. When input is exhausted, merge all sorted runs (and any spill
+///    files) to produce a total order.
 ///
 /// # When data fits in available memory
 ///
-/// If there is sufficient memory, data is sorted in memory to produce the output
+/// Sorted runs are merged in memory using a loser-tree k-way merge
+/// (via [`StreamingMergeBuilder`]).
 ///
 /// ```text
-///    ┌─────┐
-///    │  2  │
-///    │  3  │
-///    │  1  │─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-///    │  4  │
-///    │  2  │                  │
-///    └─────┘                  ▼
-///    ┌─────┐
-///    │  1  │              In memory
-///    │  4  │─ ─ ─ ─ ─ ─▶ sort/merge  ─ ─ ─ ─ ─▶  total sorted output
-///    │  1  │
-///    └─────┘                  ▲
-///      ...                    │
-///
-///    ┌─────┐                  │
-///    │  4  │
-///    │  3  │─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-///    └─────┘
-///
-/// in_mem_batches
+///   ┌──────────┐     ┌────────────┐     ┌──────┐     ┌────────────┐
+///   │ Incoming │────▶│  Batch     │────▶│ Sort │────▶│ Sorted Run │
+///   │ Batches  │     │ Coalescer  │     │      │     │ (in memory)│
+///   └──────────┘     └────────────┘     └──────┘     └─────┬──────┘
+///                                                          │
+///                                           ┌──────────────┘
+///                                           ▼
+///                                    k-way merge (loser tree)
+///                                           │
+///                                           ▼
+///                                    total sorted output
 /// ```
 ///
 /// # When data does not fit in available memory
 ///
-///  When memory is exhausted, data is first sorted and written to one
-///  or more spill files on disk:
+/// When memory is exhausted, sorted runs are spilled directly to disk
+/// (one spill file per run — no merge needed since runs are already
+/// sorted). [`MultiLevelMerge`] handles the final merge from disk
+/// with dynamic fan-in.
 ///
 /// ```text
-///    ┌─────┐                               .─────────────────.
-///    │  2  │                              (                   )
-///    │  3  │                              │`─────────────────'│
-///    │  1  │─ ─ ─ ─ ─ ─ ─                 │  ┌────┐           │
-///    │  4  │             │                │  │ 1  │░          │
-///    │  2  │                              │  │... │░          │
-///    └─────┘             ▼                │  │ 4  │░  ┌ ─ ─   │
-///    ┌─────┐                              │  └────┘░    1  │░ │
-///    │  1  │         In memory            │   ░░░░░░  │    ░░ │
-///    │  4  │─ ─ ▶   sort/merge    ─ ─ ─ ─ ┼ ─ ─ ─ ─ ─▶ ... │░ │
-///    │  1  │     and write to file        │           │    ░░ │
-///    └─────┘                              │             4  │░ │
-///      ...               ▲                │           └░─░─░░ │
-///                        │                │            ░░░░░░ │
-///    ┌─────┐                              │.─────────────────.│
-///    │  4  │             │                (                   )
-///    │  3  │─ ─ ─ ─ ─ ─ ─                  `─────────────────'
-///    └─────┘
-///
-/// in_mem_batches                                  spills
-///                                         (file on disk in Arrow
-///                                               IPC format)
+///   ┌──────────┐     ┌────────────┐     ┌──────┐     ┌────────────┐
+///   │ Incoming │────▶│  Batch     │────▶│ Sort │────▶│ Sorted Run │
+///   │ Batches  │     │ Coalescer  │     │      │     │            │
+///   └──────────┘     └────────────┘     └──────┘     └─────┬──────┘
+///                                                          │
+///                           memory pressure ◀──────────────┘
+///                                  │
+///                                  ▼
+///                       .─────────────────.
+///                      (   Spill to disk   )
+///                      │  (one file/run)   │
+///                       `─────────────────'
+///                                  │
+///              ┌───────────────────┘
+///              ▼
+///   MultiLevelMerge (dynamic fan-in)
+///              │
+///              ▼
+///   total sorted output
 /// ```
 ///
-/// Once the input is completely read, the spill files are read and
-/// merged with any in memory batches to produce a single total sorted
-/// output:
+/// # Graceful degradation
 ///
-/// ```text
-///   .─────────────────.
-///  (                   )
-///  │`─────────────────'│
-///  │  ┌────┐           │
-///  │  │ 1  │░          │
-///  │  │... │─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─
-///  │  │ 4  │░ ┌────┐   │           │
-///  │  └────┘░ │ 1  │░  │           ▼
-///  │   ░░░░░░ │    │░  │
-///  │          │... │─ ─│─ ─ ─ ▶ merge  ─ ─ ─▶  total sorted output
-///  │          │    │░  │
-///  │          │ 4  │░  │           ▲
-///  │          └────┘░  │           │
-///  │           ░░░░░░  │
-///  │.─────────────────.│           │
-///  (                   )
-///   `─────────────────'            │
-///         spills
-///                                  │
-///
-///                                  │
-///
-///     ┌─────┐                      │
-///     │  1  │
-///     │  4  │─ ─ ─ ─               │
-///     └─────┘       │
-///       ...                   In memory
-///                   └ ─ ─ ─▶  sort/merge
-///     ┌─────┐
-///     │  4  │                      ▲
-///     │  3  │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-///     └─────┘
-///
-///  in_mem_batches
+/// The coalesce target (32K rows) is aspirational. Under memory
+/// pressure, chunk sizes shrink and radix sort amortizes less — at
+/// `batch_size` or below, the pipeline falls back to lexsort,
+/// matching the old per-batch sort behavior.
 /// ```
 struct ExternalSorter {
     // ========================================================================
@@ -330,24 +297,9 @@ impl ExternalSorter {
             return Ok(());
         }
 
-        let input_rows = input.num_rows();
-        let input_mem = get_record_batch_memory_size(&input);
-        eprintln!(
-            "[SORT] insert_batch: {} rows, mem={}, reservation_before={}",
-            input_rows,
-            input_mem,
-            self.reservation.size()
-        );
-
         self.reserve_memory_for_merge()?;
         self.reserve_memory_for_batch_and_maybe_spill(&input)
             .await?;
-
-        eprintln!(
-            "[SORT] after reserve: reservation={}, sorted_runs={}",
-            self.reservation.size(),
-            self.sorted_runs.len()
-        );
 
         let coalescer = self
             .coalescer
@@ -357,14 +309,7 @@ impl ExternalSorter {
             .push_batch(input)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
-        // Sort any completed coalesced batches and store as runs
         self.drain_completed_batches()?;
-
-        eprintln!(
-            "[SORT] after drain: reservation={}, sorted_runs={}",
-            self.reservation.size(),
-            self.sorted_runs.len()
-        );
 
         Ok(())
     }
@@ -390,54 +335,31 @@ impl ExternalSorter {
     /// Uses radix sort when the batch is large enough to amortize encoding
     /// overhead (more than `batch_size` rows). Otherwise falls back to lexsort.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
-        let batch_rows = batch.num_rows();
-        let batch_mem = get_record_batch_memory_size(batch);
-        eprintln!(
-            "[SORT] sort_and_store_run: {} rows, batch_mem={}, reservation={}",
-            batch_rows,
-            batch_mem,
-            self.reservation.size()
-        );
-
         let use_radix_for_this_batch =
             self.use_radix && batch.num_rows() > self.batch_size;
 
         let sorted_chunks = if use_radix_for_this_batch {
-            // Radix sort on large coalesced batch, chunk output to batch_size
-            sort_batch_chunked(
-                batch,
-                &self.expr,
-                self.batch_size,
-                true, // use_radix
-            )?
+            sort_batch_chunked(batch, &self.expr, self.batch_size, true)?
         } else {
-            // Lexsort (or small batch from degraded radix path)
             vec![sort_batch(batch, &self.expr, None)?]
         };
 
-        // GC StringView arrays to compact shared buffers from take().
-        // Without this, sorted StringView batches reference all buffers
-        // from the coalesced input, inflating reported memory.
+        // After take(), StringView arrays may reference shared buffers from
+        // multiple coalesced input batches, inflating reported memory size.
+        // GC compacts them so reservation tracking stays accurate.
         let sorted_chunks = Self::gc_stringview_batches(sorted_chunks)?;
-
         self.sorted_runs.push(sorted_chunks);
 
-        // Shrink reservation to match actual total of all sorted runs.
-        let total_sorted_size: usize = self
-            .sorted_runs
-            .iter()
-            .flat_map(|run| run.iter())
-            .map(get_record_batch_memory_size)
-            .sum();
-        let new_size = total_sorted_size.min(self.reservation.size());
-        self.reservation.shrink(self.reservation.size() - new_size);
-
-        eprintln!(
-            "[SORT] after sort_and_store: total_sorted_size={}, new_reservation={}, runs={}",
-            total_sorted_size,
-            self.reservation.size(),
-            self.sorted_runs.len()
+        // The 2x reservation from input batches exceeds the 1x sorted output.
+        // Shrink to release the excess back to the pool.
+        let target = self.reservation.size().min(
+            self.sorted_runs
+                .iter()
+                .flat_map(|r| r.iter())
+                .map(get_record_batch_memory_size)
+                .sum(),
         );
+        self.reservation.shrink(self.reservation.size() - target);
 
         Ok(())
     }
@@ -508,18 +430,8 @@ impl ExternalSorter {
     /// 2. A combined streaming merge incorporating sorted runs
     ///    and data from spill files on disk.
     async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
-        // Flush remaining data from the coalescer
         self.flush_coalescer()?;
         self.coalescer = None;
-
-        eprintln!(
-            "[SORT] sort(): spilled_before={}, has_sorted_runs={}, runs={}, reservation={}, merge_reservation={}",
-            self.spilled_before(),
-            self.has_sorted_runs(),
-            self.sorted_runs.len(),
-            self.reservation.size(),
-            self.merge_reservation.size()
-        );
 
         // Determine if we must take the spill path.
         //
@@ -545,18 +457,11 @@ impl ExternalSorter {
                 self.spill_sorted_runs().await?;
             }
 
-            eprintln!(
-                "[SORT] sort() spill path: reservation={}, merge_reservation={}, spill_files={}",
-                self.reservation.size(),
-                self.merge_reservation.size(),
-                self.finished_spill_files.len()
-            );
-
             StreamingMergeBuilder::new()
                 .with_sorted_spill_files(std::mem::take(&mut self.finished_spill_files))
                 .with_spill_manager(self.spill_manager.clone())
                 .with_schema(Arc::clone(&self.schema))
-                .with_expressions(&self.expr.clone())
+                .with_expressions(&self.expr)
                 .with_metrics(self.metrics.baseline.clone())
                 .with_batch_size(self.batch_size)
                 .with_fetch(None)
@@ -617,11 +522,6 @@ impl ExternalSorter {
             "sorted_runs must not be empty when attempting to spill"
         );
 
-        eprintln!(
-            "[SORT] spill_sorted_runs: spilling {} runs individually",
-            self.sorted_runs.len()
-        );
-
         let all_runs = std::mem::take(&mut self.sorted_runs);
         for run in all_runs {
             let run_size: usize = run.iter().map(get_record_batch_memory_size).sum();
@@ -649,14 +549,6 @@ impl ExternalSorter {
                 .shrink(run_size.min(self.reservation.size()));
         }
 
-        eprintln!(
-            "[SORT] spill_sorted_runs end: reservation={}, merge_reservation={}, about to re-reserve {}",
-            self.reservation.size(),
-            self.merge_reservation.size(),
-            self.sort_spill_reservation_bytes
-        );
-
-        // Reserve headroom for next sort/merge
         self.reserve_memory_for_merge()?;
 
         Ok(())
@@ -750,21 +642,15 @@ impl ExternalSorter {
             })
             .collect::<Result<_>>()?;
 
-        let result = StreamingMergeBuilder::new()
+        StreamingMergeBuilder::new()
             .with_streams(streams)
             .with_schema(Arc::clone(&self.schema))
-            .with_expressions(&self.expr.clone())
+            .with_expressions(&self.expr)
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(None)
             .with_reservation(self.reservation.new_empty())
-            .build();
-
-        if let Err(ref e) = result {
-            eprintln!("[SORT] merge_sorted_runs build failed: {e}");
-        }
-
-        result
+            .build()
     }
 
     /// If this sort may spill, pre-allocates
@@ -796,30 +682,15 @@ impl ExternalSorter {
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
             Err(e) => {
-                eprintln!(
-                    "[SORT] reserve failed: need={}, reservation={}, spilling...",
-                    size,
-                    self.reservation.size()
-                );
-                // Flush coalescer: sort whatever's accumulated (even if partial)
+                // Sort whatever the coalescer has accumulated, then spill
+                // all sorted runs to disk to free pool memory.
                 self.flush_coalescer()?;
 
                 if !self.has_sorted_runs() {
                     return Err(Self::err_with_oom_context(e));
                 }
 
-                eprintln!(
-                    "[SORT] after flush: reservation={}, runs={}",
-                    self.reservation.size(),
-                    self.sorted_runs.len()
-                );
-
-                // Spill sorted runs and try again.
                 self.spill_sorted_runs().await?;
-                eprintln!(
-                    "[SORT] after spill: reservation={}",
-                    self.reservation.size()
-                );
                 self.reservation
                     .try_grow(size)
                     .map_err(Self::err_with_oom_context)
