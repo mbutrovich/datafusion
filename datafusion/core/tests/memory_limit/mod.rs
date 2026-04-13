@@ -273,9 +273,7 @@ async fn sort_spill_reservation() {
     let scenario = Scenario::new_dictionary_strings(1);
     let partition_size = scenario.partition_size();
 
-    let base_config = SessionConfig::new()
-        // do not allow the sort to use the 'concat in place' path
-        .with_sort_in_place_threshold_bytes(10);
+    let base_config = SessionConfig::new();
 
     // This test case shows how sort_spill_reservation works by
     // purposely sorting data that requires non trivial memory to
@@ -583,7 +581,6 @@ async fn setup_context(
 
     let config = SessionConfig::new()
         .with_sort_spill_reservation_bytes(64 * 1024) // 256KB
-        .with_sort_in_place_threshold_bytes(0)
         .with_spill_compression(spill_compression)
         .with_batch_size(64) // To reduce test memory usage
         .with_target_partitions(1);

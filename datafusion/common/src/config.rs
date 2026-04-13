@@ -555,7 +555,22 @@ config_namespace! {
         /// When sorting, below what size should data be concatenated
         /// and sorted in a single RecordBatch rather than sorted in
         /// batches and merged.
-        pub sort_in_place_threshold_bytes: usize, default = 1024 * 1024
+        ///
+        /// Deprecated: this option is no longer used. The sort pipeline
+        /// now always coalesces batches before sorting. Use
+        /// `sort_coalesce_target_rows` instead.
+        pub sort_in_place_threshold_bytes: usize, warn = "`sort_in_place_threshold_bytes` is deprecated and ignored. Use `sort_coalesce_target_rows` instead.", default = 1024 * 1024
+
+        /// Target number of rows to coalesce before sorting in ExternalSorter.
+        ///
+        /// Larger values give radix sort (used for primitives and strings)
+        /// enough rows to amortize RowConverter encoding overhead. Under
+        /// memory pressure the actual chunk size may be smaller.
+        ///
+        /// For schemas that are not eligible for radix sort (all-dictionary
+        /// or nested types), the coalesce target falls back to `batch_size`
+        /// regardless of this setting.
+        pub sort_coalesce_target_rows: usize, default = 32768
 
         /// Maximum buffer capacity (in bytes) per partition for BufferExec
         /// inserted during sort pushdown optimization.
