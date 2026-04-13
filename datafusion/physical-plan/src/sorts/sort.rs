@@ -68,7 +68,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 
 use futures::{StreamExt, TryStreamExt};
-use log::trace;
+use log::{debug, trace};
 
 struct ExternalSorterMetrics {
     /// metrics
@@ -197,6 +197,10 @@ struct ExternalSorter {
     /// `Vec` is a single sorted run produced by sorting one coalesced batch.
     sorted_runs: Vec<Vec<RecordBatch>>,
 
+    /// Running total of `get_record_batch_memory_size` across all sorted runs.
+    /// Updated incrementally to avoid O(n) recomputation on every sort.
+    sorted_runs_memory: usize,
+
     /// If data has previously been spilled, the locations of the spill files (in
     /// Arrow IPC format)
     /// Within the same spill file, the data might be chunked into multiple batches,
@@ -268,12 +272,20 @@ impl ExternalSorter {
             batch_size
         };
 
-        let coalescer = BatchCoalescer::new(Arc::clone(&schema), coalesce_target_rows);
+        // For non-radix schemas (coalesce_target == batch_size), enable
+        // the large-batch bypass so incoming batches that are already
+        // batch_size rows pass through without copying.
+        let mut coalescer =
+            BatchCoalescer::new(Arc::clone(&schema), coalesce_target_rows);
+        if !use_radix {
+            coalescer = coalescer.with_biggest_coalesce_batch_size(Some(batch_size / 2));
+        }
 
         Ok(Self {
             schema,
             coalescer: Some(coalescer),
             sorted_runs: vec![],
+            sorted_runs_memory: 0,
             finished_spill_files: vec![],
             expr,
             metrics,
@@ -348,18 +360,22 @@ impl ExternalSorter {
         // multiple coalesced input batches, inflating reported memory size.
         // GC compacts them so reservation tracking stays accurate.
         let sorted_chunks = Self::gc_stringview_batches(sorted_chunks)?;
+
+        let run_size: usize =
+            sorted_chunks.iter().map(get_record_batch_memory_size).sum();
         self.sorted_runs.push(sorted_chunks);
+        self.sorted_runs_memory += run_size;
 
         // The 2x reservation from input batches exceeds the 1x sorted output.
         // Shrink to release the excess back to the pool.
-        let target = self.reservation.size().min(
-            self.sorted_runs
-                .iter()
-                .flat_map(|r| r.iter())
-                .map(get_record_batch_memory_size)
-                .sum(),
-        );
+        let target = self.sorted_runs_memory.min(self.reservation.size());
         self.reservation.shrink(self.reservation.size() - target);
+
+        debug_assert_eq!(
+            self.reservation.size(),
+            self.sorted_runs_memory,
+            "reservation should track sorted_runs_memory after shrink"
+        );
 
         Ok(())
     }
@@ -525,6 +541,10 @@ impl ExternalSorter {
         );
 
         if self.merge_reservation.size() > 0 && self.sorted_runs.len() > 1 {
+            debug!(
+                "Spilling {} sorted runs via merge to single file",
+                self.sorted_runs.len()
+            );
             // Free merge_reservation to provide pool headroom for the
             // merge cursor allocation. Re-reserved at the end.
             self.merge_reservation.free();
@@ -557,8 +577,14 @@ impl ExternalSorter {
                 });
             }
         } else {
-            // No merge headroom or single run: spill each run directly.
+            // No merge headroom or single run: spill each run as its own
+            // file to avoid allocating merge cursor infrastructure.
+            debug!(
+                "Spilling {} sorted runs as individual files (no merge headroom)",
+                self.sorted_runs.len()
+            );
             let all_runs = std::mem::take(&mut self.sorted_runs);
+            self.sorted_runs_memory = 0;
             for run in all_runs {
                 let run_size: usize = run.iter().map(get_record_batch_memory_size).sum();
 
@@ -610,6 +636,7 @@ impl ExternalSorter {
         metrics: BaselineMetrics,
     ) -> Result<SendableRecordBatchStream> {
         let all_runs = std::mem::take(&mut self.sorted_runs);
+        self.sorted_runs_memory = 0;
 
         if all_runs.is_empty() {
             return Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
@@ -3133,7 +3160,7 @@ mod tests {
             Arc::new(GreedyMemoryPool::new(100 * 1024 * 1024));
         let mut sorter = test_sorter(Arc::clone(&schema), expr, 8192, 32768, pool)?;
 
-        // 8 batches × 8192 rows = 65536 rows → 2 coalesced chunks of 32K
+        // 8 batches × 8192 rows = 65536 rows -> 2 coalesced chunks of 32K
         for i in 0..8 {
             let values: Vec<i32> = ((i * 8192)..((i + 1) * 8192)).rev().collect();
             let batch = RecordBatch::try_new(
@@ -3204,8 +3231,8 @@ mod tests {
             Arc::clone(&schema),
             expr,
             8192,
-            0,    // no merge headroom → per-run spill path
-            8192, // coalesce to batch_size → 1 run per batch
+            0,    // no merge headroom -> per-run spill path
+            8192, // coalesce to batch_size -> 1 run per batch
             SpillCompression::Uncompressed,
             &metrics_set,
             runtime,
@@ -3274,7 +3301,7 @@ mod tests {
         }
 
         assert!(sorter.spilled_before());
-        // Runs merged before spilling → fewer spill files than runs
+        // Runs merged before spilling -> fewer spill files than runs
         let spill_count = sorter.spill_count();
         assert!(
             spill_count > 0 && spill_count < 20,
