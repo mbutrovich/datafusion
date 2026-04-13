@@ -362,18 +362,30 @@ impl ExternalSorter {
 
         let run_size: usize =
             sorted_chunks.iter().map(get_record_batch_memory_size).sum();
+
         self.sorted_runs.push(sorted_chunks);
         self.sorted_runs_memory += run_size;
 
-        // The 2x reservation from input batches exceeds the 1x sorted output.
-        // Shrink to release the excess back to the pool.
-        let target = self.sorted_runs_memory.min(self.reservation.size());
-        self.reservation.shrink(self.reservation.size() - target);
+        // Align reservation to actual sorted run memory with a single pool
+        // interaction. Normally 2x reservation > 1x sorted output, so we
+        // shrink. For tiny batches (single-digit rows), per-column buffer
+        // overhead can make the sorted output slightly larger — grow
+        // unconditionally since the memory is already allocated. This uses
+        // grow() which bypasses the pool limit, so the pool's tracked total
+        // may briefly exceed its limit by a small amount (tens of KB).
+        let reservation_size = self.reservation.size();
+        if reservation_size > self.sorted_runs_memory {
+            self.reservation
+                .shrink(reservation_size - self.sorted_runs_memory);
+        } else if self.sorted_runs_memory > reservation_size {
+            self.reservation
+                .grow(self.sorted_runs_memory - reservation_size);
+        }
 
         debug_assert_eq!(
             self.reservation.size(),
             self.sorted_runs_memory,
-            "reservation should track sorted_runs_memory after shrink"
+            "reservation should track sorted_runs_memory after adjustment"
         );
 
         Ok(())
