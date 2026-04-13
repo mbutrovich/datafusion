@@ -138,7 +138,7 @@ impl ExternalSorterMetrics {
 ///
 /// When memory is exhausted, sorted runs are spilled directly to disk
 /// (one spill file per run — no merge needed since runs are already
-/// sorted). [`MultiLevelMerge`] handles the final merge from disk
+/// sorted). `MultiLevelMergeBuilder` handles the final merge from disk
 /// with dynamic fan-in.
 ///
 /// ```text
@@ -169,7 +169,6 @@ impl ExternalSorterMetrics {
 /// pressure, chunk sizes shrink and radix sort amortizes less — at
 /// `batch_size` or below, the pipeline falls back to lexsort,
 /// matching the old per-batch sort behavior.
-/// ```
 struct ExternalSorter {
     // ========================================================================
     // PROPERTIES:
@@ -451,20 +450,10 @@ impl ExternalSorter {
 
         // Determine if we must take the spill path.
         //
-        // We must spill if:
-        // 1. We already spilled during the insert phase, OR
-        // 2. We have multiple sorted runs but merge_reservation is 0.
-        //
-        // Case 2 matters because the in-memory merge needs to allocate
-        // cursor infrastructure (RowCursorStream / FieldCursorStream)
-        // at build time, before any run data is consumed. The cursor
-        // allocation comes from merge_reservation. If that's 0, the
-        // pool is fully occupied by sorted run data and the cursor
-        // can't allocate. Spilling to disk frees pool memory, and
-        // MultiLevelMerge handles the merge with dynamic fan-in —
-        // reading from spill files that don't hold pool memory.
-        let must_spill = self.spilled_before()
-            || (self.sorted_runs.len() > 1 && self.merge_reservation.size() == 0);
+        // We must spill if we already spilled during the insert phase.
+        // The merge-from-disk path handles combining spill files with
+        // any remaining in-memory runs.
+        let must_spill = self.spilled_before();
 
         if must_spill {
             // Spill remaining sorted runs. Since runs are already sorted,
@@ -484,13 +473,10 @@ impl ExternalSorter {
                 .with_reservation(self.merge_reservation.take())
                 .build()
         } else {
-            // In-memory path: we have 0 runs, 1 run (no merge needed),
-            // or multiple runs with merge_reservation > 0 providing
-            // headroom for cursor allocation.
-            //
-            // Release merge_reservation back to the pool — in the
-            // non-spill path, merge_sorted_runs allocates cursor memory
-            // from the pool directly (freed merge_reservation bytes).
+            // In-memory path: no prior spills. We have 0, 1, or multiple
+            // sorted runs. Release merge_reservation (if any) back to the
+            // pool — merge_sorted_runs allocates cursor memory from pool
+            // headroom directly.
             self.merge_reservation.free();
             self.merge_sorted_runs(self.metrics.baseline.clone())
         }
