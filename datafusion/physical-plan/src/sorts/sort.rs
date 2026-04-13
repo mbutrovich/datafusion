@@ -508,32 +508,46 @@ impl ExternalSorter {
 
     /// Spills sorted runs to disk.
     ///
-    /// Unlike the old pipeline where `in_mem_batches` held unsorted data
-    /// that required merging before spilling, our sorted runs are already
-    /// sorted. We can spill each run directly as its own spill file.
-    /// MultiLevelMerge handles the fan-in during the final merge.
+    /// Two strategies depending on available merge headroom:
     ///
-    /// This also avoids the need to allocate merge cursor infrastructure
-    /// (RowCursorStream / FieldCursorStream) during the spill, which is
-    /// important when the pool has no headroom (sort_spill_reservation_bytes=0).
+    /// - **With headroom** (`merge_reservation > 0`): merge all runs into
+    ///   a single globally-sorted stream, then write to one spill file.
+    ///   Fewer spill files = lower fan-in for the final MultiLevelMerge.
+    ///
+    /// - **Without headroom** (`merge_reservation == 0`): spill each run
+    ///   as its own file. Avoids allocating merge cursor infrastructure
+    ///   when the pool has no room. MultiLevelMerge handles the higher
+    ///   fan-in with dynamic memory management.
     async fn spill_sorted_runs(&mut self) -> Result<()> {
         assert_or_internal_err!(
             self.has_sorted_runs(),
             "sorted_runs must not be empty when attempting to spill"
         );
 
-        let all_runs = std::mem::take(&mut self.sorted_runs);
-        for run in all_runs {
-            let run_size: usize = run.iter().map(get_record_batch_memory_size).sum();
+        if self.merge_reservation.size() > 0 && self.sorted_runs.len() > 1 {
+            // Free merge_reservation to provide pool headroom for the
+            // merge cursor allocation. Re-reserved at the end.
+            self.merge_reservation.free();
 
-            // Initialize a new spill file for this run
+            let mut sorted_stream =
+                self.merge_sorted_runs(self.metrics.baseline.intermediate())?;
+            assert_or_internal_err!(
+                self.sorted_runs.is_empty(),
+                "sorted_runs should be empty after constructing sorted stream"
+            );
+
             let mut in_progress =
                 self.spill_manager.create_in_progress_file("Sorting")?;
             let mut max_batch_memory = 0usize;
-            for batch in &run {
-                in_progress.append_batch(batch)?;
+
+            while let Some(batch) = sorted_stream.next().await {
+                let batch = batch?;
                 max_batch_memory = max_batch_memory.max(batch.get_sliced_size()?);
+                in_progress.append_batch(&batch)?;
             }
+
+            drop(sorted_stream);
+            self.reservation.free();
 
             let spill_file = in_progress.finish()?;
             if let Some(spill_file) = spill_file {
@@ -542,11 +556,32 @@ impl ExternalSorter {
                     max_record_batch_memory: max_batch_memory,
                 });
             }
+        } else {
+            // No merge headroom or single run: spill each run directly.
+            let all_runs = std::mem::take(&mut self.sorted_runs);
+            for run in all_runs {
+                let run_size: usize = run.iter().map(get_record_batch_memory_size).sum();
 
-            // Drop the run data and release its reservation
-            drop(run);
-            self.reservation
-                .shrink(run_size.min(self.reservation.size()));
+                let mut in_progress =
+                    self.spill_manager.create_in_progress_file("Sorting")?;
+                let mut max_batch_memory = 0usize;
+                for batch in &run {
+                    in_progress.append_batch(batch)?;
+                    max_batch_memory = max_batch_memory.max(batch.get_sliced_size()?);
+                }
+
+                let spill_file = in_progress.finish()?;
+                if let Some(spill_file) = spill_file {
+                    self.finished_spill_files.push(SortedSpillFile {
+                        file: spill_file,
+                        max_record_batch_memory: max_batch_memory,
+                    });
+                }
+
+                drop(run);
+                self.reservation
+                    .shrink(run_size.min(self.reservation.size()));
+            }
         }
 
         self.reserve_memory_for_merge()?;
@@ -3169,8 +3204,8 @@ mod tests {
             Arc::clone(&schema),
             expr,
             8192,
-            50 * 1024, // sort_spill_reservation
-            8192,      // coalesce to batch_size → 1 run per batch
+            0,    // no merge headroom → per-run spill path
+            8192, // coalesce to batch_size → 1 run per batch
             SpillCompression::Uncompressed,
             &metrics_set,
             runtime,
@@ -3191,6 +3226,59 @@ mod tests {
             sorter.spill_count() > 1,
             "Expected multiple spill files, got {}",
             sorter.spill_count()
+        );
+
+        let batches = collect_and_verify_sorted(&mut sorter).await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 20 * 8192);
+
+        Ok(())
+    }
+
+    /// With merge headroom (sort_spill_reservation_bytes > 0), runs are
+    /// merged into a single sorted stream before spilling to one file.
+    #[tokio::test]
+    async fn test_spill_merges_runs_with_headroom() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let expr: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into();
+
+        // Pool sized to trigger spilling after a few coalesced runs but
+        // leave enough room for the merge-before-spill path to work.
+        // merge_reservation must cover merge cursor infrastructure (~131KB
+        // for i32 with spawn_buffered + SortPreservingMergeStream).
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(600 * 1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()?;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut sorter = ExternalSorter::new(
+            0,
+            Arc::clone(&schema),
+            expr,
+            8192,
+            200 * 1024, // merge headroom: enough for merge cursor infrastructure
+            32768,
+            SpillCompression::Uncompressed,
+            &metrics_set,
+            runtime,
+        )?;
+
+        for i in 0..20 {
+            let values: Vec<i32> = ((i * 8192)..((i + 1) * 8192)).rev().collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )?;
+            sorter.insert_batch(batch).await?;
+        }
+
+        assert!(sorter.spilled_before());
+        // Runs merged before spilling → fewer spill files than runs
+        let spill_count = sorter.spill_count();
+        assert!(
+            spill_count > 0 && spill_count < 20,
+            "Expected merged spill files, got {spill_count}",
         );
 
         let batches = collect_and_verify_sorted(&mut sorter).await?;
