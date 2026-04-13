@@ -3038,4 +3038,165 @@ mod tests {
             }
         }
     }
+
+    /// Helper to create an ExternalSorter for testing
+    fn test_sorter(
+        schema: SchemaRef,
+        expr: LexOrdering,
+        batch_size: usize,
+        sort_coalesce_target_rows: usize,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<ExternalSorter> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()?;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        ExternalSorter::new(
+            0,
+            schema,
+            expr,
+            batch_size,
+            10 * 1024 * 1024,
+            sort_coalesce_target_rows,
+            SpillCompression::Uncompressed,
+            &metrics_set,
+            runtime,
+        )
+    }
+
+    /// Collect sorted output and verify ascending order on column 0.
+    async fn collect_and_verify_sorted(
+        sorter: &mut ExternalSorter,
+    ) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::clone(&sorter.schema);
+        let stream = sorter.sort().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let merged = concat_batches(&schema, &batches)?;
+        if merged.num_rows() > 1 {
+            let col = merged.column(0).as_primitive::<Int32Type>();
+            for i in 1..col.len() {
+                assert!(
+                    col.value(i - 1) <= col.value(i),
+                    "Not sorted at index {i}: {} > {}",
+                    col.value(i - 1),
+                    col.value(i)
+                );
+            }
+        }
+        Ok(batches)
+    }
+
+    /// Radix-eligible batches are coalesced to `sort_coalesce_target_rows`
+    /// and chunked back to `batch_size` after sorting.
+    #[tokio::test]
+    async fn test_chunked_sort_radix_coalescing() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let expr: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into();
+
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(100 * 1024 * 1024));
+        let mut sorter = test_sorter(Arc::clone(&schema), expr, 8192, 32768, pool)?;
+
+        // 8 batches × 8192 rows = 65536 rows → 2 coalesced chunks of 32K
+        for i in 0..8 {
+            let values: Vec<i32> = ((i * 8192)..((i + 1) * 8192)).rev().collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )?;
+            sorter.insert_batch(batch).await?;
+        }
+
+        assert_eq!(sorter.sorted_runs.len(), 2);
+        // 32K rows / 8K batch_size = 4 chunks per run
+        assert_eq!(sorter.sorted_runs[0].len(), 4);
+        assert_eq!(sorter.sorted_runs[1].len(), 4);
+
+        let batches = collect_and_verify_sorted(&mut sorter).await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 65536);
+
+        Ok(())
+    }
+
+    /// When sort() is called before the coalesce target is reached,
+    /// the partial coalescer contents are flushed and sorted.
+    #[tokio::test]
+    async fn test_chunked_sort_partial_flush() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let expr: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into();
+
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(100 * 1024 * 1024));
+        let mut sorter = test_sorter(Arc::clone(&schema), expr, 8192, 32768, pool)?;
+
+        // 2 batches × 8192 = 16384 rows (below 32K target)
+        for i in 0..2 {
+            let values: Vec<i32> = ((i * 8192)..((i + 1) * 8192)).rev().collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )?;
+            sorter.insert_batch(batch).await?;
+        }
+
+        // Data is in the coalescer, not yet sorted into runs
+        assert_eq!(sorter.sorted_runs.len(), 0);
+
+        let batches = collect_and_verify_sorted(&mut sorter).await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 16384);
+
+        Ok(())
+    }
+
+    /// Spilling writes one spill file per sorted run (no merge before spill).
+    #[tokio::test]
+    async fn test_spill_creates_one_file_per_run() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let expr: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into();
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(500 * 1024));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()?;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let mut sorter = ExternalSorter::new(
+            0,
+            Arc::clone(&schema),
+            expr,
+            8192,
+            50 * 1024, // sort_spill_reservation
+            8192,      // coalesce to batch_size → 1 run per batch
+            SpillCompression::Uncompressed,
+            &metrics_set,
+            runtime,
+        )?;
+
+        for i in 0..20 {
+            let values: Vec<i32> = ((i * 8192)..((i + 1) * 8192)).rev().collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )?;
+            sorter.insert_batch(batch).await?;
+        }
+
+        assert!(sorter.spilled_before());
+        // Each run spills as its own file (not merged into one)
+        assert!(
+            sorter.spill_count() > 1,
+            "Expected multiple spill files, got {}",
+            sorter.spill_count()
+        );
+
+        let batches = collect_and_verify_sorted(&mut sorter).await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 20 * 8192);
+
+        Ok(())
+    }
 }
