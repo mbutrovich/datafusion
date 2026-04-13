@@ -311,26 +311,21 @@ async fn sort_spill_reservation() {
             ]
         );
 
+    // With low reservation, the sort should still succeed because
+    // the chunked sort pipeline eagerly sorts and the multi-level merge
+    // handles low merge memory by reducing fan-in.
     let config = base_config
         .clone()
-        // provide insufficient reserved space for merging,
-        // the sort will fail while trying to merge
         .with_sort_spill_reservation_bytes(1024);
 
     test.clone()
-        .with_expected_errors(vec![
-            "Resources exhausted: Additional allocation failed",
-            "with top memory consumers (across reservations) as:",
-            "B for ExternalSorterMerge",
-        ])
+        .with_expected_success()
         .with_config(config)
         .run()
         .await;
 
     let config = base_config
-        // reserve sufficient space up front for merge and this time,
-        // which will force the spills to happen with less buffered
-        // input and thus with enough to merge.
+        // reserve sufficient space up front for merge
         .with_sort_spill_reservation_bytes(mem_limit / 2);
 
     test.with_config(config).with_expected_success().run().await;

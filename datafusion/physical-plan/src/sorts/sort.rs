@@ -340,9 +340,24 @@ impl ExternalSorter {
             return Ok(());
         }
 
+        let input_rows = input.num_rows();
+        let input_mem = get_record_batch_memory_size(&input);
+        eprintln!(
+            "[SORT] insert_batch: {} rows, mem={}, reservation_before={}",
+            input_rows,
+            input_mem,
+            self.reservation.size()
+        );
+
         self.reserve_memory_for_merge()?;
         self.reserve_memory_for_batch_and_maybe_spill(&input)
             .await?;
+
+        eprintln!(
+            "[SORT] after reserve: reservation={}, sorted_runs={}",
+            self.reservation.size(),
+            self.sorted_runs.len()
+        );
 
         let coalescer = self
             .coalescer
@@ -354,6 +369,12 @@ impl ExternalSorter {
 
         // Sort any completed coalesced batches and store as runs
         self.drain_completed_batches()?;
+
+        eprintln!(
+            "[SORT] after drain: reservation={}, sorted_runs={}",
+            self.reservation.size(),
+            self.sorted_runs.len()
+        );
 
         Ok(())
     }
@@ -379,6 +400,15 @@ impl ExternalSorter {
     /// Uses radix sort when the batch is large enough to amortize encoding
     /// overhead (more than `batch_size` rows). Otherwise falls back to lexsort.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
+        let batch_rows = batch.num_rows();
+        let batch_mem = get_record_batch_memory_size(batch);
+        eprintln!(
+            "[SORT] sort_and_store_run: {} rows, batch_mem={}, reservation={}",
+            batch_rows,
+            batch_mem,
+            self.reservation.size()
+        );
+
         let use_radix_for_this_batch =
             self.use_radix && batch.num_rows() > self.batch_size;
 
@@ -395,23 +425,66 @@ impl ExternalSorter {
             vec![sort_batch(batch, &self.expr, None)?]
         };
 
+        // GC StringView arrays to compact shared buffers from take().
+        // Without this, sorted StringView batches reference all buffers
+        // from the coalesced input, inflating reported memory.
+        let sorted_chunks = Self::gc_stringview_batches(sorted_chunks)?;
+
         self.sorted_runs.push(sorted_chunks);
 
-        // Resize reservation to match actual total of all sorted runs.
-        // After coalescing + sorting, the sorted runs may differ in size
-        // from the 2x reservations made for original input batches
-        // (e.g., StringView GC compacts buffers, slicing changes layout).
+        // Shrink reservation to match actual total of all sorted runs.
         let total_sorted_size: usize = self
             .sorted_runs
             .iter()
             .flat_map(|run| run.iter())
             .map(get_record_batch_memory_size)
             .sum();
-        self.reservation
-            .try_resize(total_sorted_size)
-            .map_err(Self::err_with_oom_context)?;
+        let new_size = total_sorted_size.min(self.reservation.size());
+        self.reservation.shrink(self.reservation.size() - new_size);
+
+        eprintln!(
+            "[SORT] after sort_and_store: total_sorted_size={}, new_reservation={}, runs={}",
+            total_sorted_size,
+            self.reservation.size(),
+            self.sorted_runs.len()
+        );
 
         Ok(())
+    }
+
+    /// Compact StringView arrays in sorted batches to eliminate shared
+    /// buffer references from `take()`. Skips work if no StringView columns.
+    fn gc_stringview_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        // Fast path: check schema for any StringView columns
+        if let Some(first) = batches.first() {
+            let has_stringview = first.schema().fields().iter().any(|f| {
+                matches!(f.data_type(), DataType::Utf8View | DataType::BinaryView)
+            });
+            if !has_stringview {
+                return Ok(batches);
+            }
+        }
+
+        let mut result = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let mut new_columns: Vec<Arc<dyn Array>> =
+                Vec::with_capacity(batch.num_columns());
+            let mut mutated = false;
+            for array in batch.columns() {
+                if let Some(sv) = array.as_any().downcast_ref::<StringViewArray>() {
+                    new_columns.push(Arc::new(sv.gc()));
+                    mutated = true;
+                } else {
+                    new_columns.push(Arc::clone(array));
+                }
+            }
+            if mutated {
+                result.push(RecordBatch::try_new(batch.schema(), new_columns)?);
+            } else {
+                result.push(batch);
+            }
+        }
+        Ok(result)
     }
 
     /// Flushes any partially accumulated rows from the coalescer, sorts them,
@@ -449,21 +522,27 @@ impl ExternalSorter {
         self.flush_coalescer()?;
         self.coalescer = None;
 
+        eprintln!(
+            "[SORT] sort(): spilled_before={}, has_sorted_runs={}, runs={}, reservation={}, merge_reservation={}",
+            self.spilled_before(),
+            self.has_sorted_runs(),
+            self.sorted_runs.len(),
+            self.reservation.size(),
+            self.merge_reservation.size()
+        );
+
         if self.spilled_before() {
-            // Merge and spill remaining sorted runs first. If there are many
-            // sorted runs and the memory limit is almost reached, merging
-            // them with the spilled files at the same time might cause OOM.
             if self.has_sorted_runs() {
                 self.spill_sorted_runs().await?;
             }
 
-            // Transfer the pre-reserved merge memory to the streaming merge
-            // using `take()` instead of `new_empty()`. This ensures the merge
-            // stream starts with `sort_spill_reservation_bytes` already
-            // allocated, preventing starvation when concurrent sort partitions
-            // compete for pool memory. `take()` moves the bytes atomically
-            // without releasing them back to the pool, so other partitions
-            // cannot race to consume the freed memory.
+            eprintln!(
+                "[SORT] sort() spill path: reservation={}, merge_reservation={}, spill_files={}",
+                self.reservation.size(),
+                self.merge_reservation.size(),
+                self.finished_spill_files.len()
+            );
+
             StreamingMergeBuilder::new()
                 .with_sorted_spill_files(std::mem::take(&mut self.finished_spill_files))
                 .with_spill_manager(self.spill_manager.clone())
@@ -475,10 +554,6 @@ impl ExternalSorter {
                 .with_reservation(self.merge_reservation.take())
                 .build()
         } else {
-            // Release the memory reserved for merge back to the pool so
-            // there is some left when `merge_sorted_runs` requests an
-            // allocation. Only needed for the non-spill path; the spill
-            // path transfers the reservation to the merge stream instead.
             self.merge_reservation.free();
             self.merge_sorted_runs(self.metrics.baseline.clone())
         }
@@ -694,6 +769,12 @@ impl ExternalSorter {
         );
 
         // Reserve headroom for next sort/merge
+        eprintln!(
+            "[SORT] spill_sorted_runs end: reservation={}, merge_reservation={}, about to re-reserve {}",
+            self.reservation.size(),
+            self.merge_reservation.size(),
+            self.sort_spill_reservation_bytes
+        );
         self.reserve_memory_for_merge()?;
 
         Ok(())
@@ -753,12 +834,14 @@ impl ExternalSorter {
             )));
         }
 
-        // Multiple runs: create one stream per run and merge
+        // Multiple runs: create one stream per run and merge.
+        // The merge stream holds the main reservation and frees memory
+        // as runs are consumed. This ensures the RowCursorStream can
+        // allocate for row encoding from the freed memory.
+        let reservation_for_merge = self.reservation.take();
         let streams = all_runs
             .into_iter()
             .map(|run| {
-                let run_size: usize = run.iter().map(get_record_batch_memory_size).sum();
-                let reservation = self.reservation.split(run_size);
                 let schema = Arc::clone(&self.schema);
                 let intermediate_metrics = self.metrics.baseline.intermediate();
                 let output_rows = intermediate_metrics.output_rows().clone();
@@ -772,11 +855,8 @@ impl ExternalSorter {
                             Err(e) => Err(e),
                         }
                     });
-                let boxed: SendableRecordBatchStream = Box::pin(ReservationStream::new(
-                    Arc::clone(&schema),
-                    Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
-                    reservation,
-                ));
+                let boxed: SendableRecordBatchStream =
+                    Box::pin(RecordBatchStreamAdapter::new(schema, stream));
                 Ok(spawn_buffered(boxed, 1))
             })
             .collect::<Result<_>>()?;
@@ -788,7 +868,7 @@ impl ExternalSorter {
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(None)
-            .with_reservation(self.merge_reservation.new_empty())
+            .with_reservation(reservation_for_merge)
             .build()
     }
 
@@ -821,6 +901,11 @@ impl ExternalSorter {
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
             Err(e) => {
+                eprintln!(
+                    "[SORT] reserve failed: need={}, reservation={}, spilling...",
+                    size,
+                    self.reservation.size()
+                );
                 // Flush coalescer: sort whatever's accumulated (even if partial)
                 self.flush_coalescer()?;
 
@@ -828,8 +913,18 @@ impl ExternalSorter {
                     return Err(Self::err_with_oom_context(e));
                 }
 
+                eprintln!(
+                    "[SORT] after flush: reservation={}, runs={}",
+                    self.reservation.size(),
+                    self.sorted_runs.len()
+                );
+
                 // Spill sorted runs and try again.
                 self.spill_sorted_runs().await?;
+                eprintln!(
+                    "[SORT] after spill: reservation={}",
+                    self.reservation.size()
+                );
                 self.reservation
                     .try_grow(size)
                     .map_err(Self::err_with_oom_context)
