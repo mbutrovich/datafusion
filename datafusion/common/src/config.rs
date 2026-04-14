@@ -574,7 +574,7 @@ config_namespace! {
         /// multi-column sorts but has higher overhead for small batches.
         /// Set to false to isolate the performance impact of the
         /// coalesce-then-sort pipeline from radix sort itself.
-        pub sort_use_radix: bool, default = false
+        pub sort_use_radix: bool, default = true
 
         /// Maximum buffer capacity (in bytes) per partition for BufferExec
         /// inserted during sort pushdown optimization.
