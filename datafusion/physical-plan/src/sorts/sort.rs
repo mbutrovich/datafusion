@@ -347,9 +347,8 @@ impl ExternalSorter {
     /// Sorts a single coalesced batch and stores the result as a new run.
     ///
     /// Uses radix sort for multi-column radix-eligible schemas when the
-    /// batch is large enough to amortize RowConverter encoding overhead
-    /// (more than `batch_size` rows). Falls back to lexsort for small
-    /// batches (e.g. early flush under memory pressure).
+    /// batch reached `sort_coalesce_target_rows`. Falls back to lexsort
+    /// for smaller batches (e.g. the final partial flush).
     /// Both paths chunk output back to `batch_size`.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
         let use_radix =
@@ -1813,10 +1812,8 @@ mod tests {
         );
 
         // Build 200 partitions, each with one 100-row batch containing a
-        // Utf8 column (~42 bytes per value) and an Int32 column. The second
-        // column ensures the radix sort path is used (use_radix_sort
-        // requires > 1 sort column), which keeps the coalesce target at
-        // sort_coalesce_target_rows instead of falling back to batch_size.
+        // Utf8 column (~42 bytes per value) and an Int32 column. Two sort
+        // columns so use_radix_sort returns true and the radix path is exercised.
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Utf8, true),
             Field::new("j", DataType::Int32, true),
@@ -1976,7 +1973,7 @@ mod tests {
             SessionConfig::new().with_batch_size(batch_size), // Ensure we don't concat batches
         ));
 
-        // Two columns so the radix path is used and sorted runs are chunked.
+        // Two columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -2574,8 +2571,7 @@ mod tests {
         batch_size_to_generate: usize,
         create_task_ctx: impl Fn(&[RecordBatch]) -> TaskContext,
     ) -> Result<MetricsSet> {
-        // Two-column batches so use_radix_sort returns true and sorted runs
-        // are chunked to batch_size, which these tests depend on.
+        // Two-column batches so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int32, true),
             Field::new("j", DataType::Int32, true),
@@ -2853,7 +2849,7 @@ mod tests {
             .build_arc()?;
 
         let metrics_set = ExecutionPlanMetricsSet::new();
-        // Two columns so radix sort is used, matching the coalesce_target_rows config.
+        // Two columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, false),
             Field::new("y", DataType::Int32, false),
@@ -3279,7 +3275,7 @@ mod tests {
     /// and chunked back to `batch_size` after sorting.
     #[tokio::test]
     async fn test_chunked_sort_radix_coalescing() -> Result<()> {
-        // Two sort columns required so use_radix_sort returns true.
+        // Two sort columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, false),
             Field::new("y", DataType::Int32, false),
@@ -3323,7 +3319,7 @@ mod tests {
     /// the partial coalescer contents are flushed and sorted.
     #[tokio::test]
     async fn test_chunked_sort_partial_flush() -> Result<()> {
-        // Two sort columns required so use_radix_sort returns true.
+        // Two sort columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, false),
             Field::new("y", DataType::Int32, false),
@@ -3364,7 +3360,7 @@ mod tests {
     /// Spilling writes one spill file per sorted run (no merge before spill).
     #[tokio::test]
     async fn test_spill_creates_one_file_per_run() -> Result<()> {
-        // Two sort columns required so use_radix_sort returns true.
+        // Two sort columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, false),
             Field::new("y", DataType::Int32, false),
@@ -3424,7 +3420,7 @@ mod tests {
     /// merged into a single sorted stream before spilling to one file.
     #[tokio::test]
     async fn test_spill_merges_runs_with_headroom() -> Result<()> {
-        // Two sort columns required so use_radix_sort returns true.
+        // Two sort columns so use_radix_sort returns true.
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, false),
             Field::new("y", DataType::Int32, false),
