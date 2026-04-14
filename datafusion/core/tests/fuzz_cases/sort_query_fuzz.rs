@@ -419,6 +419,8 @@ impl SortFuzzerTestGenerator {
     pub fn generate_random_query(&self, rng_seed: u64) -> (String, Option<usize>) {
         let mut rng = StdRng::seed_from_u64(rng_seed);
 
+        // Pick 1-3 ORDER BY columns. Single-column queries exercise the
+        // lexsort path; multi-column queries exercise the radix sort path.
         let num_columns = rng.random_range(1..=3).min(self.selected_columns.len());
         let selected_columns: Vec<_> = self
             .selected_columns
