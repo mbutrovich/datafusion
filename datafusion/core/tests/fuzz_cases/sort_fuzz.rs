@@ -61,7 +61,7 @@ async fn test_sort_10k_mem() {
 #[cfg_attr(tarpaulin, ignore)]
 async fn test_sort_100k_mem() {
     for (batch_size, should_spill) in
-        [(5, false), (10000, false), (20000, true), (1000000, true)]
+        [(5, false), (10000, false), (20000, false), (1000000, true)]
     {
         let (input, collected) = SortTest::new()
             .with_int32_batches(batch_size)
