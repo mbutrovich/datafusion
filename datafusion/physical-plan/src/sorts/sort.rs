@@ -315,8 +315,6 @@ impl ExternalSorter {
     }
 
     /// Sorts a single coalesced batch and stores the result as a new run.
-    ///
-    /// Sorts a single coalesced batch and stores the result as a new run.
     /// Output is chunked back to `batch_size`.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
         let sorted_chunks = sort_batch_chunked(batch, &self.expr, self.batch_size)?;
@@ -442,14 +440,10 @@ impl ExternalSorter {
         self.flush_coalescer()?;
         self.coalescer = None;
 
-        // Determine if we must take the spill path.
-        //
-        // We must spill if we already spilled during the insert phase.
-        // The merge-from-disk path handles combining spill files with
-        // any remaining in-memory runs.
-        let must_spill = self.spilled_before();
-
-        if must_spill {
+        // If we spilled during the insert phase, some data is on disk
+        // and we must take the merge-from-disk path. Otherwise we can
+        // merge entirely in memory.
+        if self.spilled_before() {
             // Spill remaining sorted runs. Since runs are already sorted,
             // each is written directly as its own spill file (no merge needed).
             if self.has_sorted_runs() {
