@@ -878,6 +878,12 @@ pub(super) fn use_radix_sort(data_types: &[&DataType]) -> bool {
             | DataType::Struct(_)
             | DataType::Map(_, _)
             | DataType::Union(_, _) => return false,
+            // Decimal128/256 row-encode to 17/33 bytes with poor prefix
+            // entropy (values cluster in narrow numeric ranges). MSD radix
+            // sort burns through prefix bytes doing minimal partitioning,
+            // then falls back to quicksort — paying radix overhead with no
+            // benefit over lexsort.
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => return false,
             _ => all_dict = false,
         }
     }
@@ -2983,6 +2989,10 @@ mod tests {
 
         // Mixed dict + primitive -> radix
         assert!(use_radix_sort(&[&dict_type, &DataType::Int32]));
+
+        // Decimal -> lexsort (poor prefix entropy in row encoding)
+        assert!(!use_radix_sort(&[&DataType::Decimal128(38, 10)]));
+        assert!(!use_radix_sort(&[&DataType::Decimal256(76, 20)]));
 
         // Empty -> no radix
         assert!(!use_radix_sort(&[]));
