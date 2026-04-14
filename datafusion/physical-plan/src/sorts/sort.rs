@@ -53,7 +53,7 @@ use crate::{
 };
 
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
-use arrow::compute::{BatchCoalescer, lexsort_to_indices, take_arrays};
+use arrow::compute::{BatchCoalescer, SortColumn, lexsort_to_indices, take_arrays};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
@@ -346,13 +346,17 @@ impl ExternalSorter {
     /// Uses radix sort when the batch is large enough to amortize encoding
     /// overhead (more than `batch_size` rows). Otherwise falls back to lexsort.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
-        let use_radix_for_this_batch =
-            self.use_radix && batch.num_rows() > self.batch_size;
+        let use_chunked_radix = self.use_radix && batch.num_rows() > self.batch_size;
 
-        let sorted_chunks = if use_radix_for_this_batch {
+        let sorted_chunks = if use_chunked_radix {
             sort_batch_chunked(batch, &self.expr, self.batch_size, true)?
         } else {
-            vec![sort_batch(batch, &self.expr, None)?]
+            let sort_columns = self
+                .expr
+                .iter()
+                .map(|e| e.evaluate_to_sort_column(batch))
+                .collect::<Result<Vec<_>>>()?;
+            vec![sort_batch_with(batch, &sort_columns, None, false)?]
         };
 
         // After take(), StringView arrays may reference shared buffers from
@@ -826,15 +830,29 @@ pub fn sort_batch(
         .map(|expr| expr.evaluate_to_sort_column(batch))
         .collect::<Result<Vec<_>>>()?;
 
-    if fetch.is_none()
+    let use_radix = fetch.is_none()
         && use_radix_sort(
             &sort_columns
                 .iter()
                 .map(|c| c.values.data_type())
                 .collect::<Vec<_>>(),
-        )
-    {
-        let indices = super::radix::radix_sort_to_indices(&sort_columns)?;
+        );
+
+    sort_batch_with(batch, &sort_columns, fetch, use_radix)
+}
+
+/// Sort a batch with an explicit radix vs lexsort decision.
+///
+/// Used by [`ExternalSorter`] which pre-computes the radix eligibility
+/// once at construction time to avoid repeated schema checks.
+fn sort_batch_with(
+    batch: &RecordBatch,
+    sort_columns: &[SortColumn],
+    fetch: Option<usize>,
+    use_radix: bool,
+) -> Result<RecordBatch> {
+    if use_radix {
+        let indices = super::radix::radix_sort_to_indices(sort_columns)?;
         let columns = take_arrays(batch.columns(), &indices, None)?;
         let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
         return Ok(RecordBatch::try_new_with_options(
@@ -844,7 +862,7 @@ pub fn sort_batch(
         )?);
     }
 
-    let indices = lexsort_to_indices(&sort_columns, fetch)?;
+    let indices = lexsort_to_indices(sort_columns, fetch)?;
     let columns = take_arrays(batch.columns(), &indices, None)?;
 
     let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
