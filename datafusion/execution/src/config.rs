@@ -489,6 +489,16 @@ impl SessionConfig {
         self
     }
 
+    /// Enables or disables radix sort for multi-column sorts over eligible types.
+    ///
+    /// When false, always uses lexsort regardless of schema eligibility.
+    ///
+    /// [`sort_use_radix`]: datafusion_common::config::ExecutionOptions::sort_use_radix
+    pub fn with_sort_use_radix(mut self, sort_use_radix: bool) -> Self {
+        self.options_mut().execution.sort_use_radix = sort_use_radix;
+        self
+    }
+
     /// Enables or disables the enforcement of batch size in joins
     pub fn with_enforce_batch_size_in_joins(
         mut self,

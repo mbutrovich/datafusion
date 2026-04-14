@@ -35,7 +35,8 @@ use crate::filter_pushdown::{
 };
 use crate::limit::LimitStream;
 use crate::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    SpillMetrics,
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::IncrementalSortIterator;
@@ -75,6 +76,12 @@ struct ExternalSorterMetrics {
     baseline: BaselineMetrics,
 
     spill_metrics: SpillMetrics,
+
+    /// Number of batches sorted with radix sort
+    radix_sorted_batches: Count,
+
+    /// Number of batches sorted with lexsort
+    lexsort_sorted_batches: Count,
 }
 
 impl ExternalSorterMetrics {
@@ -82,6 +89,10 @@ impl ExternalSorterMetrics {
         Self {
             baseline: BaselineMetrics::new(metrics, partition),
             spill_metrics: SpillMetrics::new(metrics, partition),
+            radix_sorted_batches: MetricBuilder::new(metrics)
+                .counter("radix_sorted_batches", partition),
+            lexsort_sorted_batches: MetricBuilder::new(metrics)
+                .counter("lexsort_sorted_batches", partition),
         }
     }
 }
@@ -93,13 +104,11 @@ impl ExternalSorterMetrics {
 ///
 /// # Algorithm
 ///
-/// Incoming batches are coalesced via [`BatchCoalescer`] to a target
-/// row count before sorting. For radix-eligible schemas (primitives,
-/// strings) the target is `sort_coalesce_target_rows` (default 32768);
-/// for non-radix schemas (all-dictionary, nested types) it falls back
-/// to `batch_size`. This gives sort kernels enough rows to amortize
-/// overhead — radix sort is 2-3x faster than lexsort at 32K+ rows
-/// but slower at small batch sizes.
+/// Incoming batches are coalesced via [`BatchCoalescer`] to
+/// `sort_coalesce_target_rows` (default 32768) before sorting. This gives
+/// sort kernels enough rows to amortize overhead and reduces merge fan-in.
+/// Radix sort is used for multi-column radix-eligible schemas; lexsort
+/// is used otherwise (single-column, all-dictionary, nested types).
 ///
 /// Each coalesced batch is sorted immediately (radix or lexsort) and
 /// stored as a pre-sorted run. Under memory pressure the coalescer
@@ -180,6 +189,9 @@ struct ExternalSorter {
     expr: LexOrdering,
     /// The target number of rows for output batches
     batch_size: usize,
+    /// The target number of rows for coalesced batches before sorting.
+    /// Radix sort is only used when a batch reaches this size.
+    sort_coalesce_target_rows: usize,
     /// Whether to use radix sort (decided once from expression types).
     use_radix: bool,
 
@@ -238,6 +250,7 @@ impl ExternalSorter {
         batch_size: usize,
         sort_spill_reservation_bytes: usize,
         sort_coalesce_target_rows: usize,
+        sort_use_radix: bool,
         // Configured via `datafusion.execution.spill_compression`.
         spill_compression: SpillCompression,
         metrics: &ExecutionPlanMetricsSet,
@@ -263,22 +276,11 @@ impl ExternalSorter {
             .iter()
             .map(|e| e.expr.data_type(&schema))
             .collect::<Result<_>>()?;
-        let use_radix = use_radix_sort(&sort_data_types.iter().collect::<Vec<_>>());
+        let use_radix =
+            sort_use_radix && use_radix_sort(&sort_data_types.iter().collect::<Vec<_>>());
 
-        let coalesce_target_rows = if use_radix {
-            sort_coalesce_target_rows
-        } else {
-            batch_size
-        };
-
-        // For non-radix schemas (coalesce_target == batch_size), enable
-        // the large-batch bypass so incoming batches that are already
-        // batch_size rows pass through without copying.
-        let mut coalescer =
-            BatchCoalescer::new(Arc::clone(&schema), coalesce_target_rows);
-        if !use_radix {
-            coalescer = coalescer.with_biggest_coalesce_batch_size(Some(batch_size / 2));
-        }
+        let coalescer =
+            BatchCoalescer::new(Arc::clone(&schema), sort_coalesce_target_rows);
 
         Ok(Self {
             schema,
@@ -293,6 +295,7 @@ impl ExternalSorter {
             merge_reservation,
             runtime,
             batch_size,
+            sort_coalesce_target_rows,
             sort_spill_reservation_bytes,
             use_radix,
         })
@@ -343,21 +346,21 @@ impl ExternalSorter {
 
     /// Sorts a single coalesced batch and stores the result as a new run.
     ///
-    /// Uses radix sort when the batch is large enough to amortize encoding
-    /// overhead (more than `batch_size` rows). Otherwise falls back to lexsort.
+    /// Uses radix sort for multi-column radix-eligible schemas when the
+    /// batch is large enough to amortize RowConverter encoding overhead
+    /// (more than `batch_size` rows). Falls back to lexsort for small
+    /// batches (e.g. early flush under memory pressure).
+    /// Both paths chunk output back to `batch_size`.
     fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
-        let use_chunked_radix = self.use_radix && batch.num_rows() > self.batch_size;
-
-        let sorted_chunks = if use_chunked_radix {
-            sort_batch_chunked(batch, &self.expr, self.batch_size, true)?
+        let use_radix =
+            self.use_radix && batch.num_rows() >= self.sort_coalesce_target_rows;
+        if use_radix {
+            self.metrics.radix_sorted_batches.add(1);
         } else {
-            let sort_columns = self
-                .expr
-                .iter()
-                .map(|e| e.evaluate_to_sort_column(batch))
-                .collect::<Result<Vec<_>>>()?;
-            vec![sort_batch_with(batch, &sort_columns, None, false)?]
-        };
+            self.metrics.lexsort_sorted_batches.add(1);
+        }
+        let sorted_chunks =
+            sort_batch_chunked(batch, &self.expr, self.batch_size, use_radix)?;
 
         // After take(), StringView arrays may reference shared buffers from
         // multiple coalesced input batches, inflating reported memory size.
@@ -1355,6 +1358,7 @@ impl ExecutionPlan for SortExec {
                     context.session_config().batch_size(),
                     execution_options.sort_spill_reservation_bytes,
                     execution_options.sort_coalesce_target_rows,
+                    execution_options.sort_use_radix,
                     context.session_config().spill_compression(),
                     &self.metrics_set,
                     context.runtime_env(),
@@ -2866,6 +2870,7 @@ mod tests {
             128, // batch_size
             sort_spill_reservation_bytes,
             32768, // sort_coalesce_target_rows
+            true,  // sort_use_radix
             SpillCompression::Uncompressed,
             &metrics_set,
             Arc::clone(&runtime),
@@ -3241,6 +3246,7 @@ mod tests {
             batch_size,
             10 * 1024 * 1024,
             sort_coalesce_target_rows,
+            true, // sort_use_radix
             SpillCompression::Uncompressed,
             &metrics_set,
             runtime,
@@ -3381,6 +3387,7 @@ mod tests {
             8192,
             0,    // no merge headroom -> per-run spill path
             8192, // coalesce to batch_size -> 1 run per batch
+            true, // sort_use_radix
             SpillCompression::Uncompressed,
             &metrics_set,
             runtime,
@@ -3444,6 +3451,7 @@ mod tests {
             8192,
             200 * 1024, // merge headroom: enough for merge cursor infrastructure
             32768,
+            true, // sort_use_radix
             SpillCompression::Uncompressed,
             &metrics_set,
             runtime,

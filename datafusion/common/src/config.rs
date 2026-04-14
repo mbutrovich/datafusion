@@ -563,14 +563,18 @@ config_namespace! {
 
         /// Target number of rows to coalesce before sorting in ExternalSorter.
         ///
-        /// Larger values give radix sort (used for primitives and strings)
-        /// enough rows to amortize RowConverter encoding overhead. Under
-        /// memory pressure the actual chunk size may be smaller.
-        ///
-        /// For schemas that are not eligible for radix sort (all-dictionary
-        /// or nested types), the coalesce target falls back to `batch_size`
-        /// regardless of this setting.
+        /// Larger values reduce merge fan-in and give radix sort enough rows
+        /// to amortize RowConverter encoding overhead.
         pub sort_coalesce_target_rows: usize, default = 32768
+
+        /// When true, use radix sort for multi-column sorts over eligible
+        /// types (primitives, strings). When false, always use lexsort.
+        ///
+        /// Radix sort is 2-3x faster than lexsort at 32K+ rows for
+        /// multi-column sorts but has higher overhead for small batches.
+        /// Set to false to isolate the performance impact of the
+        /// coalesce-then-sort pipeline from radix sort itself.
+        pub sort_use_radix: bool, default = true
 
         /// Maximum buffer capacity (in bytes) per partition for BufferExec
         /// inserted during sort pushdown optimization.
