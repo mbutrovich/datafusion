@@ -180,7 +180,7 @@ async fn test_invalid_memory_limit_when_limit_is_not_numeric() {
 async fn test_max_temp_directory_size_enforcement() {
     let ctx = SessionContext::new();
 
-    ctx.sql("SET datafusion.runtime.memory_limit = '1M'")
+    ctx.sql("SET datafusion.runtime.memory_limit = '256K'")
         .await
         .unwrap()
         .collect()

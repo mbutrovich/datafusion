@@ -419,6 +419,7 @@ impl SortFuzzerTestGenerator {
     pub fn generate_random_query(&self, rng_seed: u64) -> (String, Option<usize>) {
         let mut rng = StdRng::seed_from_u64(rng_seed);
 
+        // Pick 1-3 ORDER BY columns.
         let num_columns = rng.random_range(1..=3).min(self.selected_columns.len());
         let selected_columns: Vec<_> = self
             .selected_columns
@@ -497,17 +498,6 @@ impl SortFuzzerTestGenerator {
                 ..=(per_partition_mem_limit as f64 * 0.3) as usize,
         );
 
-        // 1 to 3 times of the approx batch size. Setting this to a very large nvalue
-        // will cause external sort to fail.
-        let sort_in_place_threshold_bytes = if with_memory_limit {
-            // For memory-limited query, setting `sort_in_place_threshold_bytes` too
-            // large will cause failure.
-            0
-        } else {
-            let dataset_size = self.dataset_state.as_ref().unwrap().dataset_size;
-            rng.random_range(0..=dataset_size * 2_usize)
-        };
-
         // Set up strings for printing
         let memory_limit_str = if with_memory_limit {
             human_readable_size(memory_limit)
@@ -530,16 +520,11 @@ impl SortFuzzerTestGenerator {
             "    Sort spill reservation bytes: {}",
             human_readable_size(sort_spill_reservation_bytes)
         );
-        println!(
-            "    Sort in place threshold bytes: {}",
-            human_readable_size(sort_in_place_threshold_bytes)
-        );
 
         let config = SessionConfig::new()
             .with_target_partitions(num_partitions)
             .with_batch_size(init_state.approx_batch_num_rows / 2)
-            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes)
-            .with_sort_in_place_threshold_bytes(sort_in_place_threshold_bytes);
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
 
         let memory_pool: Arc<dyn MemoryPool> = if with_memory_limit {
             Arc::new(FairSpillPool::new(memory_limit))

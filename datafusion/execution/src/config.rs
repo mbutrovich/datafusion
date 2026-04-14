@@ -455,13 +455,36 @@ impl SessionConfig {
     /// Set the size of [`sort_in_place_threshold_bytes`] to control
     /// how sort does things.
     ///
+    /// Deprecated: this option is no longer used. Use
+    /// [`with_sort_coalesce_target_rows`] instead.
+    ///
     /// [`sort_in_place_threshold_bytes`]: datafusion_common::config::ExecutionOptions::sort_in_place_threshold_bytes
+    /// [`with_sort_coalesce_target_rows`]: Self::with_sort_coalesce_target_rows
+    #[deprecated(
+        since = "46.0.0",
+        note = "No longer used. Sort pipeline now coalesces batches before sorting. Use with_sort_coalesce_target_rows instead."
+    )]
     pub fn with_sort_in_place_threshold_bytes(
         mut self,
         sort_in_place_threshold_bytes: usize,
     ) -> Self {
         self.options_mut().execution.sort_in_place_threshold_bytes =
             sort_in_place_threshold_bytes;
+        self
+    }
+
+    /// Set the target number of rows to coalesce before sorting.
+    ///
+    /// Larger values reduce merge fan-in by producing fewer, larger
+    /// sorted runs.
+    ///
+    /// [`sort_coalesce_target_rows`]: datafusion_common::config::ExecutionOptions::sort_coalesce_target_rows
+    pub fn with_sort_coalesce_target_rows(
+        mut self,
+        sort_coalesce_target_rows: usize,
+    ) -> Self {
+        self.options_mut().execution.sort_coalesce_target_rows =
+            sort_coalesce_target_rows;
         self
     }
 

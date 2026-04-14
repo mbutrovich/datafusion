@@ -273,9 +273,7 @@ async fn sort_spill_reservation() {
     let scenario = Scenario::new_dictionary_strings(1);
     let partition_size = scenario.partition_size();
 
-    let base_config = SessionConfig::new()
-        // do not allow the sort to use the 'concat in place' path
-        .with_sort_in_place_threshold_bytes(10);
+    let base_config = SessionConfig::new();
 
     // This test case shows how sort_spill_reservation works by
     // purposely sorting data that requires non trivial memory to
@@ -313,26 +311,19 @@ async fn sort_spill_reservation() {
             ]
         );
 
-    let config = base_config
-        .clone()
-        // provide insufficient reserved space for merging,
-        // the sort will fail while trying to merge
-        .with_sort_spill_reservation_bytes(1024);
+    // With low reservation, the sort should still succeed because
+    // the chunked sort pipeline eagerly sorts and the multi-level merge
+    // handles low merge memory by reducing fan-in.
+    let config = base_config.clone().with_sort_spill_reservation_bytes(1024);
 
     test.clone()
-        .with_expected_errors(vec![
-            "Resources exhausted: Additional allocation failed",
-            "with top memory consumers (across reservations) as:",
-            "B for ExternalSorterMerge",
-        ])
+        .with_expected_success()
         .with_config(config)
         .run()
         .await;
 
     let config = base_config
-        // reserve sufficient space up front for merge and this time,
-        // which will force the spills to happen with less buffered
-        // input and thus with enough to merge.
+        // reserve sufficient space up front for merge
         .with_sort_spill_reservation_bytes(mem_limit / 2);
 
     test.with_config(config).with_expected_success().run().await;
@@ -583,7 +574,6 @@ async fn setup_context(
 
     let config = SessionConfig::new()
         .with_sort_spill_reservation_bytes(64 * 1024) // 256KB
-        .with_sort_in_place_threshold_bytes(0)
         .with_spill_compression(spill_compression)
         .with_batch_size(64) // To reduce test memory usage
         .with_target_partitions(1);
