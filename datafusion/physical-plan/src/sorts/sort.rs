@@ -370,13 +370,29 @@ impl ExternalSorter {
         self.sorted_runs.push(sorted_chunks);
         self.sorted_runs_memory += run_size;
 
-        // Align reservation to actual sorted run memory with a single pool
-        // interaction. Normally 2x reservation > 1x sorted output, so we
-        // shrink. For tiny batches (single-digit rows), per-column buffer
-        // overhead can make the sorted output slightly larger — grow
-        // unconditionally since the memory is already allocated. This uses
-        // grow() which bypasses the pool limit, so the pool's tracked total
-        // may briefly exceed its limit by a small amount (tens of KB).
+        // Align the pool reservation to match actual sorted run memory.
+        //
+        // Before sorting we reserve 2x the input batch size (space for
+        // both the unsorted input and the sorted output). After sorting
+        // we drop the input, so normally sorted_runs_memory < reservation
+        // and we shrink to free the excess back to the pool.
+        //
+        // The grow path handles a rare edge case: for very small batches
+        // (single-digit rows), Arrow's per-column buffer minimums (64
+        // bytes each) can make the sorted output slightly larger than
+        // the reservation. We use grow() rather than try_grow() because:
+        //
+        //   1. The memory is already allocated — the sorted run exists
+        //      in self.sorted_runs. This is accounting catch-up, not a
+        //      new allocation request.
+        //   2. Under-reporting is worse than over-reporting. If we
+        //      swallowed a try_grow() failure, the pool would think
+        //      there is free headroom that doesn't actually exist,
+        //      which could cause other operators to over-allocate and
+        //      trigger a real OOM.
+        //   3. The overshoot is small and bounded: it is at most the
+        //      per-column buffer overhead for a handful of rows, which
+        //      is tens of KB even with wide schemas.
         let reservation_size = self.reservation.size();
         if reservation_size > self.sorted_runs_memory {
             self.reservation
