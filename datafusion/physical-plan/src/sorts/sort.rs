@@ -52,8 +52,10 @@ use crate::{
     Statistics,
 };
 
-use arrow::array::{Array, RecordBatch, RecordBatchOptions, StringViewArray};
-use arrow::compute::{BatchCoalescer, lexsort_to_indices, take_arrays};
+use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions, StringViewArray};
+use arrow::compute::{
+    concat_batches, interleave_record_batch, lexsort_to_indices, take_arrays,
+};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
@@ -65,7 +67,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -93,19 +95,28 @@ impl ExternalSorterMetrics {
 ///
 /// # Algorithm
 ///
-/// Incoming batches are coalesced via [`BatchCoalescer`] to
-/// `sort_coalesce_target_rows` (default 32768) before sorting. This
-/// reduces merge fan-in by producing fewer, larger sorted runs.
+/// Incoming batches accumulate in an input buffer until
+/// `sort_coalesce_target_rows` (default 32768) rows are reached. At
+/// that point, only the sort-key columns are extracted (with
+/// `StringArray`/`BinaryArray` promoted to view types for
+/// cache-friendly coalescing), concatenated, and sorted via
+/// `lexsort_to_indices`. The resulting permutation is translated to
+/// `(batch_index, row_index)` pairs and applied via
+/// `interleave_record_batch` on the original full-schema batches,
+/// producing a sorted run chunked to `batch_size`.
 ///
-/// Each coalesced batch is sorted immediately and stored as a
-/// pre-sorted run.
+/// This key-only approach avoids copying non-key columns during
+/// coalescing and sorting, which is critical for wide schemas (e.g.
+/// small key + large value columns). The StringView promotion means
+/// coalescing string sort keys only copies 16-byte view structs
+/// rather than random-accessing heap-allocated string data.
 ///
 /// 1. For each incoming batch:
-///    - Reserve memory (2x batch size). If reservation fails, flush
-///      the coalescer, spill all sorted runs to disk, then retry.
-///    - Push batch into the coalescer.
-///    - If the coalescer reached its target: sort the coalesced batch
-///      and store as a new sorted run.
+///    - Reserve memory (2x batch size). If reservation fails, sort
+///      and store the buffer, spill all sorted runs to disk, then retry.
+///    - Push batch into the input buffer.
+///    - If the buffer reached the coalesce target: extract keys,
+///      sort, interleave into a new sorted run.
 ///
 /// 2. When input is exhausted, merge all sorted runs (and any spill
 ///    files) to produce a total order.
@@ -116,17 +127,17 @@ impl ExternalSorterMetrics {
 /// (via [`StreamingMergeBuilder`]).
 ///
 /// ```text
-///   ┌──────────┐     ┌────────────┐     ┌──────┐     ┌────────────┐
-///   │ Incoming │────▶│  Batch     │────▶│ Sort │────▶│ Sorted Run │
-///   │ Batches  │     │ Coalescer  │     │      │     │ (in memory)│
-///   └──────────┘     └────────────┘     └──────┘     └─────┬──────┘
-///                                                          │
-///                                           ┌──────────────┘
-///                                           ▼
-///                                    k-way merge (loser tree)
-///                                           │
-///                                           ▼
-///                                    total sorted output
+///   ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌────────────┐
+///   │ Incoming │────▶│   Input    │────▶│  Key-only    │────▶│ Sorted Run │
+///   │ Batches  │     │  Buffer    │     │ Sort + Inter-│     │ (in memory)│
+///   └──────────┘     └────────────┘     │    leave     │     └─────┬──────┘
+///                                       └──────────────┘           │
+///                                                   ┌──────────────┘
+///                                                   ▼
+///                                            k-way merge (loser tree)
+///                                                   │
+///                                                   ▼
+///                                            total sorted output
 /// ```
 ///
 /// # When data does not fit in available memory
@@ -137,12 +148,12 @@ impl ExternalSorterMetrics {
 /// with dynamic fan-in.
 ///
 /// ```text
-///   ┌──────────┐     ┌────────────┐     ┌──────┐     ┌────────────┐
-///   │ Incoming │────▶│  Batch     │────▶│ Sort │────▶│ Sorted Run │
-///   │ Batches  │     │ Coalescer  │     │      │     │            │
-///   └──────────┘     └────────────┘     └──────┘     └─────┬──────┘
-///                                                          │
-///                           memory pressure ◀──────────────┘
+///   ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌────────────┐
+///   │ Incoming │────▶│   Input    │────▶│  Key-only    │────▶│ Sorted Run │
+///   │ Batches  │     │  Buffer    │     │ Sort + Inter-│     │            │
+///   └──────────┘     └────────────┘     │    leave     │     └─────┬──────┘
+///                                       └──────────────┘           │
+///                           memory pressure ◀──────────────────────┘
 ///                                  │
 ///                                  ▼
 ///                       .─────────────────.
@@ -160,9 +171,9 @@ impl ExternalSorterMetrics {
 ///
 /// # Graceful degradation
 ///
-/// The coalesce target (32K rows) is aspirational. The final batch
-/// will be smaller if the input row count is not a multiple of the
-/// target.
+/// The coalesce target (32K rows) is aspirational. Runs will contain
+/// however many whole input batches were buffered when the threshold
+/// was reached, so run sizes may slightly exceed the target.
 struct ExternalSorter {
     // ========================================================================
     // PROPERTIES:
@@ -174,18 +185,31 @@ struct ExternalSorter {
     expr: LexOrdering,
     /// The target number of rows for output batches
     batch_size: usize,
+    /// Schema of key-only batches (one column per sort expression).
+    /// StringArray/BinaryArray types are promoted to view types for
+    /// cache-friendly coalescing.
+    key_schema: SchemaRef,
+    /// Sort expressions rewritten for the key-only schema: Column(0),
+    /// Column(1), etc. with the same SortOptions as `expr`.
+    key_sort_exprs: LexOrdering,
+    /// Target row count to accumulate before sorting a run.
+    coalesce_target_rows: usize,
 
     // ========================================================================
     // STATE BUFFERS:
     // Fields that hold intermediate data during sorting
     // ========================================================================
-    /// Accumulates incoming batches until `coalesce_target_rows` is reached,
-    /// at which point the coalesced batch is sorted and stored as a run.
-    /// Set to `None` after `sort()` consumes it.
-    coalescer: Option<BatchCoalescer>,
+    /// Buffer of original full-schema input batches. Accumulates until
+    /// `input_buffer_rows >= coalesce_target_rows`, at which point the
+    /// buffer is drained, sorted by key, and stored as a run.
+    input_buffer: Vec<RecordBatch>,
+
+    /// Running row count across all batches in `input_buffer`.
+    input_buffer_rows: usize,
 
     /// Pre-sorted runs of `batch_size`-chunked `RecordBatch`es. Each inner
-    /// `Vec` is a single sorted run produced by sorting one coalesced batch.
+    /// `Vec` is a single sorted run produced by sorting one buffer's worth
+    /// of input batches.
     sorted_runs: Vec<Vec<RecordBatch>>,
 
     /// Running total of `get_record_batch_memory_size` across all sorted runs.
@@ -206,7 +230,12 @@ struct ExternalSorter {
     metrics: ExternalSorterMetrics,
     /// A handle to the runtime to get spill files
     runtime: Arc<RuntimeEnv>,
-    /// Reservation for sorted_runs (and coalescer contents)
+    /// Reservation for input_buffer and sorted_runs.
+    ///
+    /// Each incoming batch reserves 2x its memory size: 1x for the batch
+    /// sitting in `input_buffer`, and 1x headroom for the interleaved
+    /// sort output during `sort_buffered_run`. This ensures peak memory
+    /// (input + output simultaneously) never exceeds the reservation.
     reservation: MemoryReservation,
     spill_manager: SpillManager,
 
@@ -251,31 +280,64 @@ impl ExternalSorter {
         )
         .with_compression_type(spill_compression);
 
-        let coalescer =
-            BatchCoalescer::new(Arc::clone(&schema), sort_coalesce_target_rows);
+        // Build key-only schema: one field per sort expression, with
+        // StringArray/BinaryArray promoted to view types for cache-friendly
+        // coalescing and sorting.
+        let mut key_fields = Vec::with_capacity(expr.len());
+        for (i, sort_expr) in expr.iter().enumerate() {
+            let dt = sort_expr.expr.data_type(&schema)?;
+            let promoted_dt = match &dt {
+                DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+                DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
+                other => other.clone(),
+            };
+            key_fields.push(arrow::datatypes::Field::new(
+                format!("key_{i}"),
+                promoted_dt,
+                sort_expr.expr.nullable(&schema)?,
+            ));
+        }
+        let key_schema = Arc::new(arrow::datatypes::Schema::new(key_fields));
+
+        // Build sort expressions for the key-only schema: Column(0), Column(1), ...
+        let key_sort_exprs: LexOrdering =
+            LexOrdering::new(expr.iter().enumerate().map(|(i, sort_expr)| {
+                PhysicalSortExpr::new(
+                    Arc::new(Column::new(&format!("key_{i}"), i)),
+                    sort_expr.options,
+                )
+            }))
+            .expect("sort expressions must be non-empty");
 
         Ok(Self {
             schema,
-            coalescer: Some(coalescer),
+            expr,
+            batch_size,
+            key_schema,
+            key_sort_exprs,
+            coalesce_target_rows: sort_coalesce_target_rows,
+            input_buffer: vec![],
+            input_buffer_rows: 0,
             sorted_runs: vec![],
             sorted_runs_memory: 0,
             finished_spill_files: vec![],
-            expr,
             metrics,
             reservation,
             spill_manager,
             merge_reservation,
             runtime,
-            batch_size,
             sort_spill_reservation_bytes,
         })
     }
 
-    /// Appends an unsorted [`RecordBatch`] to the coalescer.
+    /// Appends an unsorted [`RecordBatch`] to the input buffer.
     ///
-    /// The coalescer accumulates batches until `coalesce_target_rows` is
-    /// reached, then sorts the coalesced batch and stores it as a sorted run.
-    /// Updates memory usage metrics, and possibly triggers spilling to disk.
+    /// Batches accumulate until `coalesce_target_rows` is reached, at which
+    /// point the buffer is sorted by key and stored as a sorted run.
+    /// Each incoming batch reserves 2x its memory: 1x for the batch in
+    /// `input_buffer`, 1x headroom for the interleaved sort output during
+    /// `sort_buffered_run`. This guarantees peak memory (input + output
+    /// simultaneously) never exceeds the reservation.
     async fn insert_batch(&mut self, input: RecordBatch) -> Result<()> {
         if input.num_rows() == 0 {
             return Ok(());
@@ -285,43 +347,152 @@ impl ExternalSorter {
         self.reserve_memory_for_batch_and_maybe_spill(&input)
             .await?;
 
-        let coalescer = self
-            .coalescer
-            .as_mut()
-            .expect("coalescer must exist during insert phase");
-        coalescer
-            .push_batch(input)
+        self.input_buffer_rows += input.num_rows();
+        self.input_buffer.push(input);
+
+        if self.input_buffer_rows >= self.coalesce_target_rows {
+            self.sort_buffered_run()?;
+        }
+
+        Ok(())
+    }
+
+    /// Extracts sort-key columns from a full-schema batch, evaluating sort
+    /// expressions and promoting StringArray/BinaryArray to view types.
+    ///
+    /// The view conversion is zero-copy when string offsets fit in u32 (always
+    /// true for batches under 4GB): it shares the original data buffer and
+    /// only allocates a views array (16 bytes per row per column).
+    fn extract_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let key_columns: Vec<Arc<dyn Array>> = self
+            .expr
+            .iter()
+            .map(|sort_expr| {
+                let col = sort_expr
+                    .expr
+                    .evaluate(batch)?
+                    .into_array(batch.num_rows())?;
+                Ok(match col.data_type() {
+                    DataType::Utf8 => {
+                        let arr = col.as_string::<i32>();
+                        Arc::new(StringViewArray::from(arr)) as Arc<dyn Array>
+                    }
+                    DataType::LargeUtf8 => {
+                        let arr = col.as_string::<i64>();
+                        Arc::new(StringViewArray::from(arr)) as Arc<dyn Array>
+                    }
+                    DataType::Binary => {
+                        let arr = col.as_binary::<i32>();
+                        Arc::new(arrow::array::BinaryViewArray::from(arr))
+                            as Arc<dyn Array>
+                    }
+                    DataType::LargeBinary => {
+                        let arr = col.as_binary::<i64>();
+                        Arc::new(arrow::array::BinaryViewArray::from(arr))
+                            as Arc<dyn Array>
+                    }
+                    _ => col,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(RecordBatch::try_new(
+            Arc::clone(&self.key_schema),
+            key_columns,
+        )?)
+    }
+
+    /// Sorts the buffered input batches and stores the result as a new
+    /// sorted run. This is the core pipeline:
+    ///
+    /// 1. Extract key columns from each input batch (with StringView promotion)
+    /// 2. Concatenate key columns into one batch
+    /// 3. `lexsort_to_indices` on the concatenated keys → permutation
+    /// 4. Translate flat indices to `(batch_idx, row_idx)` pairs
+    /// 5. `interleave_record_batch` per `batch_size` chunk → sorted output
+    /// 6. GC StringView arrays, store as sorted run
+    ///
+    /// # Memory states
+    ///
+    /// - Entry: reservation = 2N × batch_size. Actual = N × batch_size
+    ///   (input_buffer). The Nx headroom covers sort output.
+    /// - During interleave: input_buffer (Nx) + output chunks (up to Nx).
+    ///   Key concat and sort columns are transient, covered by headroom.
+    /// - After `input_buffer.clear()`: only sorted_runs remain. Reservation
+    ///   realigned to `sorted_runs_memory`.
+    fn sort_buffered_run(&mut self) -> Result<()> {
+        if self.input_buffer.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Extract key-only batches with StringView promotion
+        let key_batches: Vec<RecordBatch> = self
+            .input_buffer
+            .iter()
+            .map(|batch| self.extract_key_batch(batch))
+            .collect::<Result<_>>()?;
+
+        // 2. Concatenate key batches
+        let key_batch = concat_batches(&self.key_schema, &key_batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        drop(key_batches);
 
-        self.drain_completed_batches()?;
+        // 3. Sort: build SortColumns from the concatenated key batch,
+        //    then get the permutation indices
+        let sort_columns: Vec<arrow::compute::SortColumn> = self
+            .key_sort_exprs
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(&key_batch))
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(())
-    }
+        let sorted_indices = lexsort_to_indices(&sort_columns, None)?;
+        drop(sort_columns);
+        drop(key_batch);
 
-    /// Drains completed (full) batches from the coalescer, sorts each,
-    /// and appends the sorted chunks to `sorted_runs`.
-    fn drain_completed_batches(&mut self) -> Result<()> {
-        // Collect completed batches first to avoid borrow conflict
-        let mut completed = vec![];
-        if let Some(coalescer) = self.coalescer.as_mut() {
-            while let Some(batch) = coalescer.next_completed_batch() {
-                completed.push(batch);
+        // 4. Translate flat indices to (batch_idx, row_idx) pairs.
+        //    Build cumulative row boundaries for binary search.
+        let batch_starts: Vec<usize> = {
+            let mut starts = Vec::with_capacity(self.input_buffer.len());
+            let mut cumulative = 0usize;
+            for batch in &self.input_buffer {
+                starts.push(cumulative);
+                cumulative += batch.num_rows();
             }
-        }
-        for batch in &completed {
-            self.sort_and_store_run(batch)?;
-        }
-        Ok(())
-    }
+            starts
+        };
 
-    /// Sorts a single coalesced batch and stores the result as a new run.
-    /// Output is chunked back to `batch_size`.
-    fn sort_and_store_run(&mut self, batch: &RecordBatch) -> Result<()> {
-        let sorted_chunks = sort_batch_chunked(batch, &self.expr, self.batch_size)?;
+        let interleave_indices: Vec<(usize, usize)> = sorted_indices
+            .values()
+            .iter()
+            .map(|&flat_idx| {
+                let flat_idx = flat_idx as usize;
+                let batch_idx = match batch_starts.binary_search(&flat_idx) {
+                    Ok(i) => i,
+                    Err(i) => i - 1,
+                };
+                (batch_idx, flat_idx - batch_starts[batch_idx])
+            })
+            .collect();
+        drop(sorted_indices);
 
-        // After take(), StringView arrays may reference shared buffers from
-        // multiple coalesced input batches, inflating reported memory size.
-        // GC compacts them so reservation tracking stays accurate.
+        // 5. Interleave per batch_size chunk. Each call produces an
+        //    independent allocation (accurate memory accounting, and
+        //    the batch_size working set is cache-friendly).
+        let input_batch_refs: Vec<&RecordBatch> = self.input_buffer.iter().collect();
+        let total_rows = interleave_indices.len();
+        let mut sorted_chunks = Vec::with_capacity(total_rows.div_ceil(self.batch_size));
+        let mut offset = 0;
+        while offset < total_rows {
+            let len = self.batch_size.min(total_rows - offset);
+            let chunk_indices = &interleave_indices[offset..offset + len];
+            let chunk = interleave_record_batch(&input_batch_refs, chunk_indices)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            sorted_chunks.push(chunk);
+            offset += len;
+        }
+        drop(interleave_indices);
+
+        // 6. GC StringView arrays to break shared buffer references
         let sorted_chunks = Self::gc_stringview_batches(sorted_chunks)?;
 
         let run_size: usize =
@@ -330,29 +501,12 @@ impl ExternalSorter {
         self.sorted_runs.push(sorted_chunks);
         self.sorted_runs_memory += run_size;
 
+        // Clear input buffer — frees original batch memory
+        self.input_buffer.clear();
+        self.input_buffer_rows = 0;
+
         // Align the pool reservation to match actual sorted run memory.
-        //
-        // Before sorting we reserve 2x the input batch size (space for
-        // both the unsorted input and the sorted output). After sorting
-        // we drop the input, so normally sorted_runs_memory < reservation
-        // and we shrink to free the excess back to the pool.
-        //
-        // The grow path handles a rare edge case: for very small batches
-        // (single-digit rows), Arrow's per-column buffer minimums (64
-        // bytes each) can make the sorted output slightly larger than
-        // the reservation. We use grow() rather than try_grow() because:
-        //
-        //   1. The memory is already allocated — the sorted run exists
-        //      in self.sorted_runs. This is accounting catch-up, not a
-        //      new allocation request.
-        //   2. Under-reporting is worse than over-reporting. If we
-        //      swallowed a try_grow() failure, the pool would think
-        //      there is free headroom that doesn't actually exist,
-        //      which could cause other operators to over-allocate and
-        //      trigger a real OOM.
-        //   3. The overshoot is small and bounded: it is at most the
-        //      per-column buffer overhead for a handful of rows, which
-        //      is tens of KB even with wide schemas.
+        // After clearing input_buffer, only sorted_runs hold data.
         let reservation_size = self.reservation.size();
         if reservation_size > self.sorted_runs_memory {
             self.reservation
@@ -406,14 +560,11 @@ impl ExternalSorter {
         Ok(result)
     }
 
-    /// Flushes any partially accumulated rows from the coalescer, sorts them,
-    /// and stores as a run. Called before spilling and at sort() time.
-    fn flush_coalescer(&mut self) -> Result<()> {
-        if let Some(coalescer) = self.coalescer.as_mut() {
-            coalescer
-                .finish_buffered_batch()
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            self.drain_completed_batches()?;
+    /// Sorts any buffered input batches and stores as a run.
+    /// Called before spilling and at sort() time.
+    fn flush_buffers(&mut self) -> Result<()> {
+        if self.input_buffer_rows > 0 {
+            self.sort_buffered_run()?;
         }
         Ok(())
     }
@@ -437,8 +588,7 @@ impl ExternalSorter {
     /// 2. A combined streaming merge incorporating sorted runs
     ///    and data from spill files on disk.
     async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
-        self.flush_coalescer()?;
-        self.coalescer = None;
+        self.flush_buffers()?;
 
         // If we spilled during the insert phase, some data is on disk
         // and we must take the merge-from-disk path. Otherwise we can
@@ -707,8 +857,15 @@ impl ExternalSorter {
     }
 
     /// Reserves memory to be able to accommodate the given batch.
-    /// If memory is scarce, flushes the coalescer, spills sorted runs to disk,
+    /// If memory is scarce, flushes buffers, spills sorted runs to disk,
     /// and retries.
+    ///
+    /// Reserves 2x the batch size: 1x for the batch in `input_buffer`, 1x
+    /// headroom for the interleaved sort output during `sort_buffered_run`.
+    /// When the spill path fires, `flush_buffers` sorts the input_buffer
+    /// into sorted_runs (safe — the 2x reservation covers both input and
+    /// output simultaneously), then `spill_sorted_runs` writes to disk
+    /// and frees the reservation back to ~0 for the retry.
     async fn reserve_memory_for_batch_and_maybe_spill(
         &mut self,
         input: &RecordBatch,
@@ -718,9 +875,9 @@ impl ExternalSorter {
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
             Err(e) => {
-                // Sort whatever the coalescer has accumulated, then spill
+                // Sort whatever is in the input buffer, then spill
                 // all sorted runs to disk to free pool memory.
-                self.flush_coalescer()?;
+                self.flush_buffers()?;
 
                 if !self.has_sorted_runs() {
                     return Err(Self::err_with_oom_context(e));
@@ -2930,7 +3087,7 @@ mod tests {
     }
 
     /// When sort() is called before the coalesce target is reached,
-    /// the partial coalescer contents are flushed and sorted.
+    /// the partial buffer contents are flushed and sorted.
     #[tokio::test]
     async fn test_chunked_sort_partial_flush() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -2951,7 +3108,7 @@ mod tests {
             sorter.insert_batch(batch).await?;
         }
 
-        // Data is in the coalescer, not yet sorted into runs
+        // Data is in the input buffer, not yet sorted into runs
         assert_eq!(sorter.sorted_runs.len(), 0);
 
         let batches = collect_and_verify_sorted(&mut sorter).await?;
