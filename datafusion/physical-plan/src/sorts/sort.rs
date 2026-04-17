@@ -54,13 +54,13 @@ use crate::{
     Statistics,
 };
 
-use arrow::array::{
-    Array, AsArray, BinaryViewArray, RecordBatch, RecordBatchOptions, StringViewArray,
-};
+use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::{
-    SortColumn, concat_batches, lexsort_to_indices, take_arrays, take_record_batch,
+    SortColumn, concat_batches, interleave_record_batch, lexsort_to_indices, take_arrays,
+    take_record_batch,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -71,7 +71,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -101,80 +101,14 @@ impl ExternalSorterMetrics {
 ///
 /// Incoming batches accumulate in an input buffer until
 /// `sort_coalesce_target_rows` (default 32768) rows are reached.
-/// Before sorting, `StringArray`/`BinaryArray` columns are promoted
-/// to `StringViewArray`/`BinaryViewArray` (zero-copy — shares
-/// buffers) so that concatenation and `take` operate on 16-byte view
-/// structs instead of scatter-gathering string heap data. All sorted
-/// runs and spill files use this internal view-based schema.
+/// Only sort-key columns are extracted and concatenated for sorting —
+/// non-key value columns stay in the original batches and are
+/// reconstructed via `interleave_record_batch` after sorting.
 ///
-/// At the output boundary, view columns are converted back to their
-/// original types (StringArray, etc.), copying each string exactly
-/// once — matching the copy budget of a per-batch sort.
-///
-/// 1. For each incoming batch:
-///    - Reserve memory (2x batch size). If reservation fails, sort
-///      and store the buffer, spill all sorted runs to disk, then retry.
-///    - Push batch into the input buffer.
-///    - If the buffer reached the coalesce target: convert to view
-///      types, concatenate, sort, `take` per chunk, store as run.
-///
-/// 2. When input is exhausted, merge all sorted runs (and any spill
-///    files) to produce a total order, converting view columns back
-///    to their original types at the output boundary.
-///
-/// # When data fits in available memory
-///
-/// Sorted runs are merged in memory using a loser-tree k-way merge
-/// (via [`StreamingMergeBuilder`]).
-///
-/// ```text
-///   ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌────────────┐
-///   │ Incoming │────▶│   Input    │────▶│  View-based  │────▶│ Sorted Run │
-///   │ Batches  │     │  Buffer    │     │ Concat+Sort  │     │ (in memory)│
-///   └──────────┘     └────────────┘     │   + Take     │     └─────┬──────┘
-///                                       └──────────────┘           │
-///                                                   ┌──────────────┘
-///                                                   ▼
-///                                            k-way merge (loser tree)
-///                                                   │
-///                                                   ▼
-///                                          convert views → arrays
-///                                                   │
-///                                                   ▼
-///                                            total sorted output
-/// ```
-///
-/// # When data does not fit in available memory
-///
-/// When memory is exhausted, sorted runs are spilled directly to disk
-/// (one spill file per run — no merge needed since runs are already
-/// sorted). `MultiLevelMergeBuilder` handles the final merge from disk
-/// with dynamic fan-in.
-///
-/// ```text
-///   ┌──────────┐     ┌────────────┐     ┌──────────────┐     ┌────────────┐
-///   │ Incoming │────▶│   Input    │────▶│  View-based  │────▶│ Sorted Run │
-///   │ Batches  │     │  Buffer    │     │ Concat+Sort  │     │            │
-///   └──────────┘     └────────────┘     │   + Take     │     └─────┬──────┘
-///                                       └──────────────┘           │
-///                           memory pressure ◀──────────────────────┘
-///                                  │
-///                                  ▼
-///                       .─────────────────.
-///                      (   Spill to disk   )
-///                      │  (one file/run)   │
-///                       `─────────────────'
-///                                  │
-///              ┌───────────────────┘
-///              ▼
-///   MultiLevelMerge (dynamic fan-in)
-///              │
-///              ▼
-///   convert views → arrays
-///              │
-///              ▼
-///   total sorted output
-/// ```
+/// For multi-column variable-length sort keys, a RowConverter-based
+/// sort encodes keys into contiguous binary-comparable row format for
+/// cache-friendly comparisons. For single-column or fixed-width keys,
+/// `lexsort_to_indices` is used (SIMD-optimized).
 ///
 /// # Graceful degradation
 ///
@@ -183,81 +117,43 @@ impl ExternalSorterMetrics {
 /// was reached, so run sizes may slightly exceed the target.
 struct ExternalSorter {
     // ========================================================================
-    // PROPERTIES:
-    // Fields that define the sorter's configuration and remain constant
+    // PROPERTIES
     // ========================================================================
-    /// Schema of the output (and the input)
     schema: SchemaRef,
-    /// Sort expressions
     expr: LexOrdering,
-    /// The target number of rows for output batches
     batch_size: usize,
-    /// Internal schema with StringArray/BinaryArray promoted to view types.
-    /// Used for sorted runs, spill files, and the merge. Column indices
-    /// match `schema`, so sort expressions work unchanged.
-    internal_schema: SchemaRef,
-    /// Column indices where String/Binary were promoted to view types.
-    /// Empty if no promotions were needed (all columns already view or
-    /// fixed-width). Used at output time to convert back.
-    view_promoted_columns: Vec<usize>,
-    /// Target row count to accumulate before sorting a run.
+    /// Schema of key-only batches (one column per sort expression).
+    key_schema: SchemaRef,
+    /// Sort expressions rewritten for the key-only schema.
+    key_sort_exprs: LexOrdering,
+    /// Column indices in the original schema for each sort key.
+    /// usize::MAX if the sort expression is computed (not a Column ref).
+    key_column_indices: Vec<usize>,
+    /// Use RowConverter sort for multi-column variable-length keys.
+    use_row_sort: bool,
     coalesce_target_rows: usize,
 
     // ========================================================================
-    // STATE BUFFERS:
-    // Fields that hold intermediate data during sorting
+    // STATE BUFFERS
     // ========================================================================
-    /// Buffer of original full-schema input batches. Accumulates until
-    /// `input_buffer_rows >= coalesce_target_rows`, at which point the
-    /// buffer is drained, sorted by key, and stored as a run.
     input_buffer: Vec<RecordBatch>,
-
-    /// Running row count across all batches in `input_buffer`.
     input_buffer_rows: usize,
-
-    /// Pre-sorted runs of `batch_size`-chunked `RecordBatch`es in
-    /// `internal_schema`. Each inner `Vec` is a single sorted run.
     sorted_runs: Vec<Vec<RecordBatch>>,
-
-    /// Running total of `get_record_batch_memory_size` across all sorted runs.
-    /// Updated incrementally to avoid O(n) recomputation on every sort.
     sorted_runs_memory: usize,
-
-    /// If data has previously been spilled, the locations of the spill files (in
-    /// Arrow IPC format)
-    /// Within the same spill file, the data might be chunked into multiple batches,
-    /// and ordered by sort keys.
     finished_spill_files: Vec<SortedSpillFile>,
 
     // ========================================================================
-    // EXECUTION RESOURCES:
-    // Fields related to managing execution resources and monitoring performance.
+    // EXECUTION RESOURCES
     // ========================================================================
-    /// Runtime metrics
     metrics: ExternalSorterMetrics,
-    /// A handle to the runtime to get spill files
     runtime: Arc<RuntimeEnv>,
-    /// Reservation for input_buffer and sorted_runs.
-    ///
-    /// Each incoming batch reserves 2x its memory size: 1x for the batch
-    /// sitting in `input_buffer`, and 1x headroom for the sort output
-    /// during `sort_buffered_run`. This ensures peak memory (input +
-    /// output simultaneously) never exceeds the reservation.
     reservation: MemoryReservation,
     spill_manager: SpillManager,
-
-    /// Reservation for the merging of sorted runs. If the sort
-    /// might spill, `sort_spill_reservation_bytes` will be
-    /// pre-reserved to ensure there is some space for this sort/merge.
     merge_reservation: MemoryReservation,
-    /// How much memory to reserve for performing in-memory sort/merges
-    /// prior to spilling.
     sort_spill_reservation_bytes: usize,
 }
 
 impl ExternalSorter {
-    // TODO: make a builder or some other nicer API to avoid the
-    // clippy warning
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         partition_id: usize,
@@ -266,7 +162,6 @@ impl ExternalSorter {
         batch_size: usize,
         sort_spill_reservation_bytes: usize,
         sort_coalesce_target_rows: usize,
-        // Configured via `datafusion.execution.spill_compression`.
         spill_compression: SpillCompression,
         metrics: &ExecutionPlanMetricsSet,
         runtime: Arc<RuntimeEnv>,
@@ -280,51 +175,67 @@ impl ExternalSorter {
             MemoryConsumer::new(format!("ExternalSorterMerge[{partition_id}]"))
                 .register(&runtime.memory_pool);
 
-        // Build internal schema: promote String/Binary to view types so
-        // concat and take operate on 16-byte view structs instead of
-        // scatter-gathering string heap data.
-        let mut view_promoted_columns = Vec::new();
-        let internal_fields: Vec<_> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, field)| {
-                let promoted_dt = match field.data_type() {
-                    DataType::Utf8 | DataType::LargeUtf8 => {
-                        view_promoted_columns.push(i);
-                        DataType::Utf8View
-                    }
-                    DataType::Binary | DataType::LargeBinary => {
-                        view_promoted_columns.push(i);
-                        DataType::BinaryView
-                    }
-                    _ => return Arc::clone(field),
-                };
-                Arc::new(
-                    Field::new(field.name(), promoted_dt, field.is_nullable())
-                        .with_metadata(field.metadata().clone()),
-                )
-            })
-            .collect();
-        let internal_schema = Arc::new(
-            Schema::new(internal_fields).with_metadata(schema.metadata().clone()),
-        );
-
-        // Spill files use the internal schema (view types) since sorted
-        // runs are stored in that format.
         let spill_manager = SpillManager::new(
             Arc::clone(&runtime),
             metrics.spill_metrics.clone(),
-            Arc::clone(&internal_schema),
+            Arc::clone(&schema),
         )
         .with_compression_type(spill_compression);
+
+        let mut key_column_indices = Vec::with_capacity(expr.len());
+        let mut key_fields = Vec::with_capacity(expr.len());
+        let mut has_varlen_key = false;
+
+        for sort_expr in expr.iter() {
+            let dt = sort_expr.expr.data_type(&schema)?;
+            match &dt {
+                DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView => {
+                    has_varlen_key = true;
+                }
+                _ => {}
+            }
+
+            if let Some(col) = sort_expr.expr.downcast_ref::<Column>() {
+                key_column_indices.push(col.index());
+            } else {
+                key_column_indices.push(usize::MAX);
+            }
+
+            key_fields.push(Field::new(
+                format!("key_{}", key_fields.len()),
+                dt,
+                sort_expr.expr.nullable(&schema)?,
+            ));
+        }
+        let key_schema = Arc::new(Schema::new(key_fields));
+
+        // RowConverter sort for multi-column variable-length keys
+        // (contiguous row encoding, cache-friendly byte comparisons).
+        // lexsort_to_indices for everything else (SIMD-optimized).
+        let use_row_sort = expr.len() > 1 && has_varlen_key;
+
+        let key_sort_exprs: LexOrdering =
+            LexOrdering::new(expr.iter().enumerate().map(|(i, sort_expr)| {
+                PhysicalSortExpr::new(
+                    Arc::new(Column::new(&format!("key_{i}"), i)),
+                    sort_expr.options,
+                )
+            }))
+            .expect("sort expressions must be non-empty");
 
         Ok(Self {
             schema,
             expr,
             batch_size,
-            internal_schema,
-            view_promoted_columns,
+            key_schema,
+            key_sort_exprs,
+            key_column_indices,
+            use_row_sort,
             coalesce_target_rows: sort_coalesce_target_rows,
             input_buffer: vec![],
             input_buffer_rows: 0,
@@ -340,14 +251,6 @@ impl ExternalSorter {
         })
     }
 
-    /// Appends an unsorted [`RecordBatch`] to the input buffer.
-    ///
-    /// Batches accumulate until `coalesce_target_rows` is reached, at which
-    /// point the buffer is sorted by key and stored as a sorted run.
-    /// Each incoming batch reserves 2x its memory: 1x for the batch in
-    /// `input_buffer`, 1x headroom for the interleaved sort output during
-    /// `sort_buffered_run`. This guarantees peak memory (input + output
-    /// simultaneously) never exceeds the reservation.
     async fn insert_batch(&mut self, input: RecordBatch) -> Result<()> {
         if input.num_rows() == 0 {
             return Ok(());
@@ -367,65 +270,25 @@ impl ExternalSorter {
         Ok(())
     }
 
-    /// Converts a batch from the input schema to the internal schema by
-    /// promoting StringArray/BinaryArray columns to view types. The
-    /// conversion is zero-copy — it shares the original data buffer and
-    /// only allocates a views array (16 bytes per row per column).
-    fn convert_to_internal(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if self.view_promoted_columns.is_empty() {
-            return Ok(batch.clone());
-        }
-        let columns: Vec<Arc<dyn Array>> = batch
-            .columns()
+    fn extract_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let key_columns: Vec<Arc<dyn Array>> = self
+            .expr
             .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if !self.view_promoted_columns.contains(&i) {
-                    return Arc::clone(col);
-                }
-                match col.data_type() {
-                    DataType::Utf8 => {
-                        Arc::new(StringViewArray::from(col.as_string::<i32>()))
-                            as Arc<dyn Array>
-                    }
-                    DataType::LargeUtf8 => {
-                        Arc::new(StringViewArray::from(col.as_string::<i64>()))
-                            as Arc<dyn Array>
-                    }
-                    DataType::Binary => {
-                        Arc::new(BinaryViewArray::from(col.as_binary::<i32>()))
-                            as Arc<dyn Array>
-                    }
-                    DataType::LargeBinary => {
-                        Arc::new(BinaryViewArray::from(col.as_binary::<i64>()))
-                            as Arc<dyn Array>
-                    }
-                    _ => Arc::clone(col),
-                }
-            })
-            .collect();
+            .map(|sort_expr| sort_expr.expr.evaluate(batch)?.into_array(batch.num_rows()))
+            .collect::<Result<_>>()?;
+
         Ok(RecordBatch::try_new(
-            Arc::clone(&self.internal_schema),
-            columns,
+            Arc::clone(&self.key_schema),
+            key_columns,
         )?)
     }
 
-    /// Sorts the buffered input batches and stores the result as a new
-    /// sorted run in `internal_schema`.
+    /// Sorts the buffered input batches and stores as a new sorted run.
     ///
-    /// Converts String/Binary columns to view types, concatenates all
-    /// columns, sorts via `lexsort_to_indices`, then `take` per
-    /// `batch_size` chunk. View-based concat and take only copy 16-byte
-    /// view structs — string data is not touched until output conversion.
-    ///
-    /// # Memory invariant
-    ///
-    /// Each buffered batch reserved 2x its size in `insert_batch`: 1x for
-    /// the batch in `input_buffer`, 1x headroom. Peak usage is
-    /// input_buffer (Nx) + take output (up to Nx) = 2Nx. The concat
-    /// batch is transient and covered by headroom. After
-    /// `input_buffer.clear()`, only sorted_runs remain and the
-    /// reservation is realigned.
+    /// Key columns are extracted and concatenated. Sort kernel chosen
+    /// by schema: RowConverter for multi-column variable-length keys,
+    /// lexsort_to_indices otherwise. Key columns are taken from the
+    /// concat key batch; value columns are interleaved from originals.
     fn sort_buffered_run(&mut self) -> Result<()> {
         if self.input_buffer.is_empty() {
             return Ok(());
@@ -437,51 +300,102 @@ impl ExternalSorter {
                 .iter()
                 .map(|b| b.num_rows())
                 .sum::<usize>(),
-            "input_buffer_rows out of sync with actual row counts"
+            "input_buffer_rows out of sync"
         );
 
-        // Convert to internal schema (String/Binary → View) and concat
-        let concat_batch = {
-            let internal_batches: Vec<RecordBatch> = self
+        let key_batch = {
+            let key_batches: Vec<RecordBatch> = self
                 .input_buffer
                 .iter()
-                .map(|batch| self.convert_to_internal(batch))
+                .map(|batch| self.extract_key_batch(batch))
                 .collect::<Result<_>>()?;
 
-            concat_batches(&self.internal_schema, &internal_batches)
+            concat_batches(&self.key_schema, &key_batches)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-            // internal_batches freed here
         };
 
-        // Sort: evaluate sort expressions on the concatenated batch
-        let sort_columns: Vec<SortColumn> = self
-            .expr
-            .iter()
-            .map(|expr| expr.evaluate_to_sort_column(&concat_batch))
-            .collect::<Result<Vec<_>>>()?;
+        let sorted_indices = if self.use_row_sort {
+            self.row_sort(&key_batch)?
+        } else {
+            let sort_columns: Vec<SortColumn> = self
+                .key_sort_exprs
+                .iter()
+                .map(|expr| expr.evaluate_to_sort_column(&key_batch))
+                .collect::<Result<Vec<_>>>()?;
+            lexsort_to_indices(&sort_columns, None)?
+        };
 
-        let sorted_indices = lexsort_to_indices(&sort_columns, None)?;
-        drop(sort_columns);
+        let all_keys_are_column_refs =
+            self.key_column_indices.iter().all(|&i| i != usize::MAX);
+        let has_value_columns = all_keys_are_column_refs
+            && self.key_column_indices.len() < self.schema.fields().len();
 
-        // Take per batch_size chunk — for StringView this copies 16-byte
-        // view structs only (no string data movement).
         let total_rows = sorted_indices.len();
         let mut sorted_chunks = Vec::with_capacity(total_rows.div_ceil(self.batch_size));
+
+        let interleave_indices = if has_value_columns || !all_keys_are_column_refs {
+            Some(self.translate_indices(&sorted_indices))
+        } else {
+            None
+        };
+
+        let input_refs: Vec<&RecordBatch> = self.input_buffer.iter().collect();
         let mut cursor = 0;
+
         while cursor < total_rows {
             let len = self.batch_size.min(total_rows - cursor);
-            let chunk_indices = sorted_indices.slice(cursor, len);
-            let chunk = take_record_batch(&concat_batch, &chunk_indices)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            sorted_chunks.push(chunk);
+
+            let columns: Vec<Arc<dyn Array>> = if !all_keys_are_column_refs {
+                // Computed sort expressions — interleave all columns
+                let indices = interleave_indices.as_ref().unwrap();
+                let chunk =
+                    interleave_record_batch(&input_refs, &indices[cursor..cursor + len])
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                chunk.columns().to_vec()
+            } else {
+                let chunk_indices = sorted_indices.slice(cursor, len);
+                let key_chunk = take_record_batch(&key_batch, &chunk_indices)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+                if has_value_columns {
+                    let indices = interleave_indices.as_ref().unwrap();
+                    let value_chunk = interleave_record_batch(
+                        &input_refs,
+                        &indices[cursor..cursor + len],
+                    )
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+                    (0..self.schema.fields().len())
+                        .map(|schema_col| {
+                            if let Some(key_pos) = self
+                                .key_column_indices
+                                .iter()
+                                .position(|&ki| ki == schema_col)
+                            {
+                                Arc::clone(key_chunk.column(key_pos))
+                            } else {
+                                Arc::clone(value_chunk.column(schema_col))
+                            }
+                        })
+                        .collect()
+                } else {
+                    // All columns are keys — reorder to schema order
+                    (0..self.schema.fields().len())
+                        .map(|schema_col| {
+                            let key_pos = self
+                                .key_column_indices
+                                .iter()
+                                .position(|&ki| ki == schema_col)
+                                .expect("all columns should be keys");
+                            Arc::clone(key_chunk.column(key_pos))
+                        })
+                        .collect()
+                }
+            };
+
+            sorted_chunks.push(RecordBatch::try_new(Arc::clone(&self.schema), columns)?);
             cursor += len;
         }
-
-        // TODO: memory accounting for shared StringView buffers.
-        // After take, chunks share backing buffers with the concat batch,
-        // so get_record_batch_memory_size over-reports per chunk. This is
-        // conservative (safe, may spill earlier than necessary). Proper
-        // accounting for shared buffers is future work.
 
         let run_size: usize =
             sorted_chunks.iter().map(get_record_batch_memory_size).sum();
@@ -492,14 +406,6 @@ impl ExternalSorter {
         self.input_buffer.clear();
         self.input_buffer_rows = 0;
 
-        // Align the pool reservation to match actual sorted run memory.
-        // After clearing input_buffer, only sorted_runs hold data.
-        //
-        // The grow path handles a rare edge case: for very small batches,
-        // Arrow's per-column buffer minimums can make the sorted output
-        // slightly larger than the reservation. We use grow() (not
-        // try_grow()) because the memory is already allocated — this is
-        // accounting catch-up, not a new allocation request.
         let reservation_size = self.reservation.size();
         if reservation_size > self.sorted_runs_memory {
             self.reservation
@@ -512,21 +418,68 @@ impl ExternalSorter {
         debug_assert_eq!(
             self.reservation.size(),
             self.sorted_runs_memory,
-            "reservation should track sorted_runs_memory after adjustment"
+            "reservation should track sorted_runs_memory"
         );
 
         Ok(())
     }
 
-    /// Sorts any buffered input batches and stores as a run.
-    /// Called before spilling and at sort() time.
+    /// RowConverter-based sort for multi-column variable-length keys.
+    fn row_sort(&self, key_batch: &RecordBatch) -> Result<UInt32Array> {
+        let sort_fields: Vec<SortField> = self
+            .key_sort_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, sort_expr)| {
+                SortField::new_with_options(
+                    key_batch.schema().field(i).data_type().clone(),
+                    sort_expr.options,
+                )
+            })
+            .collect();
+
+        let converter = RowConverter::new(sort_fields)?;
+        let rows = converter.convert_columns(key_batch.columns())?;
+
+        let mut indices: Vec<u32> = (0..key_batch.num_rows() as u32).collect();
+        indices
+            .sort_unstable_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+
+        Ok(UInt32Array::from(indices))
+    }
+
+    fn translate_indices(&self, sorted_indices: &UInt32Array) -> Vec<(usize, usize)> {
+        let batch_starts: Vec<usize> = self
+            .input_buffer
+            .iter()
+            .scan(0usize, |cumulative, batch| {
+                let start = *cumulative;
+                *cumulative += batch.num_rows();
+                Some(start)
+            })
+            .collect();
+
+        sorted_indices
+            .values()
+            .iter()
+            .map(|&flat_idx| {
+                let flat_idx = flat_idx as usize;
+                let batch_idx = match batch_starts.binary_search(&flat_idx) {
+                    Ok(i) => i,
+                    Err(i) => i - 1,
+                };
+                debug_assert!(batch_idx < self.input_buffer.len());
+                (batch_idx, flat_idx - batch_starts[batch_idx])
+            })
+            .collect()
+    }
+
     fn flush_buffers(&mut self) -> Result<()> {
         if self.input_buffer_rows > 0 {
             self.sort_buffered_run()?;
         }
         Ok(())
     }
-
     fn spilled_before(&self) -> bool {
         !self.finished_spill_files.is_empty()
     }
@@ -548,9 +501,7 @@ impl ExternalSorter {
     async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
         self.flush_buffers()?;
 
-        // Both paths produce streams in internal_schema (with view types).
-        // Wrap with conversion back to the output schema if needed.
-        let internal_stream = if self.spilled_before() {
+        if self.spilled_before() {
             // Spill remaining sorted runs. Since runs are already sorted,
             // each is written directly as its own spill file (no merge needed).
             if self.has_sorted_runs() {
@@ -560,39 +511,19 @@ impl ExternalSorter {
             StreamingMergeBuilder::new()
                 .with_sorted_spill_files(std::mem::take(&mut self.finished_spill_files))
                 .with_spill_manager(self.spill_manager.clone())
-                .with_schema(Arc::clone(&self.internal_schema))
+                .with_schema(Arc::clone(&self.schema))
                 .with_expressions(&self.expr)
                 .with_metrics(self.metrics.baseline.clone())
                 .with_batch_size(self.batch_size)
                 .with_fetch(None)
                 .with_reservation(self.merge_reservation.take())
-                .build()?
+                .build()
         } else {
-            // In-memory path: no prior spills. We have 0, 1, or multiple
-            // sorted runs. Release merge_reservation (if any) back to the
-            // pool — merge_sorted_runs allocates cursor memory from pool
-            // headroom directly.
+            // In-memory path: release merge_reservation back to the pool —
+            // merge_sorted_runs allocates cursor memory from pool headroom.
             self.merge_reservation.free();
-            self.merge_sorted_runs(self.metrics.baseline.clone())?
-        };
-
-        // Convert view columns back to their original types at the
-        // output boundary. String bytes are copied once here — this
-        // is the only place string data is materialized.
-        if self.view_promoted_columns.is_empty() {
-            return Ok(internal_stream);
+            self.merge_sorted_runs(self.metrics.baseline.clone())
         }
-
-        let output_schema = Arc::clone(&self.schema);
-        let promoted = self.view_promoted_columns.clone();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&output_schema),
-            internal_stream.map(move |batch_result| {
-                batch_result.and_then(|ref batch| {
-                    convert_views_to_arrays(&output_schema, &promoted, batch)
-                })
-            }),
-        )))
     }
 
     /// How much memory is buffered in this `ExternalSorter`?
@@ -739,7 +670,7 @@ impl ExternalSorter {
 
         if all_runs.is_empty() {
             return Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
-                &self.internal_schema,
+                &self.schema,
             ))));
         }
 
@@ -750,7 +681,7 @@ impl ExternalSorter {
         if all_runs.len() == 1 {
             let run = all_runs.into_iter().next().unwrap();
             let reservation = self.reservation.take();
-            let schema = Arc::clone(&self.internal_schema);
+            let schema = Arc::clone(&self.schema);
             let output_rows = metrics.output_rows().clone();
             let stream =
                 futures::stream::iter(run.into_iter().map(Ok)).map(move |batch| {
@@ -784,7 +715,7 @@ impl ExternalSorter {
         let streams = all_runs
             .into_iter()
             .map(|run| {
-                let schema = Arc::clone(&self.internal_schema);
+                let schema = Arc::clone(&self.schema);
                 let intermediate_metrics = self.metrics.baseline.intermediate();
                 let output_rows = intermediate_metrics.output_rows().clone();
                 let stream =
@@ -805,7 +736,7 @@ impl ExternalSorter {
 
         StreamingMergeBuilder::new()
             .with_streams(streams)
-            .with_schema(Arc::clone(&self.internal_schema))
+            .with_schema(Arc::clone(&self.schema))
             .with_expressions(&self.expr)
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
@@ -911,30 +842,6 @@ pub(crate) fn get_reserved_bytes_for_record_batch(batch: &RecordBatch) -> Result
             sliced_size,
         )
     })
-}
-
-/// Converts promoted view columns back to their original String/Binary types.
-/// Called at the output boundary of the sort stream — this is the only place
-/// where string bytes are copied for promoted columns.
-fn convert_views_to_arrays(
-    output_schema: &SchemaRef,
-    promoted: &[usize],
-    batch: &RecordBatch,
-) -> Result<RecordBatch> {
-    let columns: Vec<Arc<dyn Array>> = batch
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            if !promoted.contains(&i) {
-                return Ok(Arc::clone(col));
-            }
-            let target_type = output_schema.field(i).data_type();
-            arrow::compute::cast(col.as_ref(), target_type)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-        })
-        .collect::<Result<_>>()?;
-    Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
 }
 
 impl Debug for ExternalSorter {
@@ -1883,7 +1790,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: memory accounting for shared StringView buffers
     async fn test_sort_spill_utf8_strings() -> Result<()> {
         let session_config = SessionConfig::new()
             .with_batch_size(100)
@@ -3283,12 +3189,9 @@ mod tests {
             Arc::new(GreedyMemoryPool::new(100 * 1024 * 1024));
         let mut sorter = test_sorter(Arc::clone(&schema), expr, 8192, 32768, pool)?;
 
-        // Internal schema should have Utf8View (promoted from Utf8)
-        assert_eq!(
-            sorter.internal_schema.field(0).data_type(),
-            &DataType::Utf8View
-        );
-        assert_eq!(sorter.view_promoted_columns, vec![0]);
+        // Key schema has one column (Utf8, the sort key type)
+        assert_eq!(sorter.key_schema.fields().len(), 1);
+        assert_eq!(sorter.key_schema.field(0).data_type(), &DataType::Utf8);
 
         let values: Vec<&str> = vec!["cherry", "apple", "banana", "date"];
         let batch = RecordBatch::try_new(
@@ -3301,7 +3204,6 @@ mod tests {
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
         let merged = concat_batches(&schema, &batches)?;
 
-        // Output is StringArray (not StringView)
         assert_eq!(merged.column(0).data_type(), &DataType::Utf8);
         let col = merged.column(0).as_string::<i32>();
         assert_eq!(
@@ -3330,18 +3232,11 @@ mod tests {
             Arc::new(GreedyMemoryPool::new(100 * 1024 * 1024));
         let mut sorter = test_sorter(Arc::clone(&schema), expr, 8192, 32768, pool)?;
 
-        // Internal schema has 2 columns: Int32 key (unchanged) + Utf8View value (promoted)
-        assert_eq!(sorter.internal_schema.fields().len(), 2);
-        assert_eq!(
-            sorter.internal_schema.field(0).data_type(),
-            &DataType::Int32
-        );
-        assert_eq!(
-            sorter.internal_schema.field(1).data_type(),
-            &DataType::Utf8View
-        );
-        // Only the value column (index 1) was promoted
-        assert_eq!(sorter.view_promoted_columns, vec![1]);
+        // Key schema has 1 column (Int32 key only, value not included)
+        assert_eq!(sorter.key_schema.fields().len(), 1);
+        assert_eq!(sorter.key_schema.field(0).data_type(), &DataType::Int32);
+        // Multi-column var-length check: single i32 key → no row sort
+        assert!(!sorter.use_row_sort);
 
         // Large value strings (1KB each)
         let large_value: String = "x".repeat(1024);
