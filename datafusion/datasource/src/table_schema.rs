@@ -138,8 +138,8 @@ impl TableSchema {
         let virtual_columns: Arc<Vec<FieldRef>> = Arc::new(vec![]);
         let table_schema = build_table_schema(
             &file_schema,
-            virtual_columns.as_ref(),
             table_partition_cols.as_ref(),
+            virtual_columns.as_ref(),
         );
         Self {
             file_schema,
@@ -174,8 +174,8 @@ impl TableSchema {
         }
         self.table_schema = build_table_schema(
             &self.file_schema,
-            self.virtual_columns.as_ref(),
             self.table_partition_cols.as_ref(),
+            self.virtual_columns.as_ref(),
         );
         self
     }
@@ -201,8 +201,8 @@ impl TableSchema {
         }
         self.table_schema = build_table_schema(
             &self.file_schema,
-            self.virtual_columns.as_ref(),
             self.table_partition_cols.as_ref(),
+            self.virtual_columns.as_ref(),
         );
         self
     }
@@ -242,8 +242,8 @@ impl TableSchema {
 
 fn build_table_schema(
     file_schema: &SchemaRef,
-    virtual_columns: &[FieldRef],
     table_partition_cols: &[FieldRef],
+    virtual_columns: &[FieldRef],
 ) -> SchemaRef {
     let mut builder = SchemaBuilder::from(file_schema.as_ref());
     builder.extend(table_partition_cols.iter().cloned());

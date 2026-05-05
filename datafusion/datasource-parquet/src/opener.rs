@@ -44,6 +44,7 @@ use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     ColumnStatistics, DataFusionError, Result, ScalarValue, Statistics, exec_err,
+    not_impl_err,
 };
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
@@ -769,10 +770,6 @@ impl MetadataLoadedParquetOpen {
         //   parquet reader will actually produce for the file's columns. Any
         //   virtual columns (see [`crate::TableSchema::virtual_columns`]) are
         //   produced separately by the reader and are not part of this schema.
-        let has_virtual_cols = !prepared.virtual_columns.is_empty();
-        // The initial `load` did not request virtual columns, so
-        // `reader_metadata.schema()` currently matches the file's own columns
-        // only.
         let mut physical_file_schema = Arc::clone(reader_metadata.schema());
 
         // The schema loaded from the file may not be the same as the
@@ -800,16 +797,10 @@ impl MetadataLoadedParquetOpen {
             metadata_dirty = true;
         }
 
-        // If the caller requested virtual columns (e.g. parquet `row_number`),
-        // register them on the reader options so the decoder produces them
-        // alongside the projected file columns. Any schema coercion above has
-        // already been applied via `options.with_schema` with only the file's
-        // own columns; arrow-rs appends virtual columns to that schema
-        // internally, so we must not include them here.
-        if has_virtual_cols {
-            options = options
-                .with_virtual_columns(prepared.virtual_columns.clone())
-                .map_err(|e| DataFusionError::External(format!("{e}").into()))?;
+        // Arrow-rs appends virtual columns to the supplied schema internally,
+        // so any `with_schema` coercion above must stay limited to file columns.
+        if !prepared.virtual_columns.is_empty() {
+            options = options.with_virtual_columns(prepared.virtual_columns.clone())?;
             metadata_dirty = true;
         }
 
@@ -845,31 +836,10 @@ impl MetadataLoadedParquetOpen {
             // expression trees. We keep `physical_file_schema` itself as the
             // pure file schema so downstream predicate pushdown, pruning, and
             // row filter construction stay unaffected.
-            let (logical_for_rewrite, physical_for_rewrite) = if has_virtual_cols {
-                let logical_augmented = Schema::new(
-                    prepared
-                        .logical_file_schema
-                        .fields()
-                        .iter()
-                        .cloned()
-                        .chain(prepared.virtual_columns.iter().cloned())
-                        .collect::<Vec<_>>(),
-                );
-                let physical_augmented = Schema::new(
-                    physical_file_schema
-                        .fields()
-                        .iter()
-                        .cloned()
-                        .chain(prepared.virtual_columns.iter().cloned())
-                        .collect::<Vec<_>>(),
-                );
-                (Arc::new(logical_augmented), Arc::new(physical_augmented))
-            } else {
-                (
-                    Arc::clone(&prepared.logical_file_schema),
-                    Arc::clone(&physical_file_schema),
-                )
-            };
+            let logical_for_rewrite =
+                append_fields(&prepared.logical_file_schema, &prepared.virtual_columns);
+            let physical_for_rewrite =
+                append_fields(&physical_file_schema, &prepared.virtual_columns);
             let rewriter = prepared.expr_adapter_factory.create(
                 Arc::clone(&logical_for_rewrite),
                 Arc::clone(&physical_for_rewrite),
@@ -1261,18 +1231,8 @@ impl RowGroupsPrunedParquetOpen {
         // The reader produces projected file columns followed by any virtual
         // columns (`ArrowReaderOptions::with_virtual_columns` appends them to
         // each decoded batch).
-        let stream_schema = if prepared.virtual_columns.is_empty() {
-            read_plan.projected_schema
-        } else {
-            let fields = read_plan
-                .projected_schema
-                .fields()
-                .iter()
-                .cloned()
-                .chain(prepared.virtual_columns.iter().cloned())
-                .collect::<Vec<_>>();
-            Arc::new(Schema::new(fields))
-        };
+        let stream_schema =
+            append_fields(&read_plan.projected_schema, &prepared.virtual_columns);
         let replace_schema = stream_schema != prepared.output_schema;
 
         // Rebase column indices to match the narrowed stream schema.
@@ -1429,25 +1389,40 @@ type ConstantColumns = HashMap<String, ScalarValue>;
 /// DataFusion's predicate and projection paths as expected.
 const SUPPORTED_VIRTUAL_EXTENSION_TYPES: &[&str] = &[RowNumber::NAME];
 
+/// Return `base` unchanged when `extra` is empty; otherwise build a new schema
+/// with `extra` appended to `base`'s fields.
+fn append_fields(base: &SchemaRef, extra: &[FieldRef]) -> SchemaRef {
+    if extra.is_empty() {
+        return Arc::clone(base);
+    }
+    let fields = base
+        .fields()
+        .iter()
+        .cloned()
+        .chain(extra.iter().cloned())
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
 fn validate_supported_virtual_columns(virtual_columns: &[FieldRef]) -> Result<()> {
     for field in virtual_columns {
-        let name = field.extension_type_name().ok_or_else(|| {
-            DataFusionError::Configuration(format!(
+        let Some(name) = field.extension_type_name() else {
+            return not_impl_err!(
                 "Virtual column '{}' is missing an Arrow extension type; \
                  virtual columns must carry one of: {:?}",
                 field.name(),
-                SUPPORTED_VIRTUAL_EXTENSION_TYPES,
-            ))
-        })?;
+                SUPPORTED_VIRTUAL_EXTENSION_TYPES
+            );
+        };
         if !SUPPORTED_VIRTUAL_EXTENSION_TYPES.contains(&name) {
-            return Err(DataFusionError::NotImplemented(format!(
+            return not_impl_err!(
                 "Virtual column '{}' uses unsupported Arrow extension type '{}'; \
                  supported types: {:?}. Add the extension type to \
                  SUPPORTED_VIRTUAL_EXTENSION_TYPES together with a test covering it.",
                 field.name(),
                 name,
-                SUPPORTED_VIRTUAL_EXTENSION_TYPES,
-            )));
+                SUPPORTED_VIRTUAL_EXTENSION_TYPES
+            );
         }
     }
     Ok(())
