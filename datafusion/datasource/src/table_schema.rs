@@ -186,7 +186,7 @@ impl TableSchema {
     /// `row_number` column) rather than being stored in the files or derived
     /// from partition paths. Each field must carry an arrow virtual extension
     /// type so the reader can recognize it; `ParquetOpener` forwards these
-    /// fields to [`parquet::arrow::arrow_reader::ArrowReaderOptions::with_virtual_columns`].
+    /// fields to `parquet::arrow::arrow_reader::ArrowReaderOptions::with_virtual_columns`.
     ///
     /// Virtual columns are appended at the end of the table schema, after any
     /// partition columns.
