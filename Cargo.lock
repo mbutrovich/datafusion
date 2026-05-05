@@ -2003,6 +2003,7 @@ name = "datafusion-datasource-parquet"
 version = "53.1.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "bytes",
  "chrono",
