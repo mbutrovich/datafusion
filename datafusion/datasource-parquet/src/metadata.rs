@@ -131,16 +131,61 @@ impl<'a> DFParquetMetadata<'a> {
         let cache_metadata =
             !cfg!(feature = "parquet_encryption") || self.decryption_properties.is_none();
 
+        let cache_ptr_str = self
+            .file_metadata_cache
+            .as_ref()
+            .map(|c| format!("{:p}", Arc::as_ptr(c)))
+            .unwrap_or_else(|| "none".to_string());
+
         if cache_metadata
             && let Some(file_metadata_cache) = self.file_metadata_cache.as_ref()
-            && let Some(cached) = file_metadata_cache.get(&self.object_meta.location)
-            && cached.is_valid_for(self.object_meta)
-            && let Some(cached_parquet) = cached
-                .file_metadata
-                .as_any()
-                .downcast_ref::<CachedParquetMetaData>()
         {
-            return Ok(Arc::clone(cached_parquet.parquet_metadata()));
+            let cache_limit = file_metadata_cache.cache_limit();
+            let entries_count = file_metadata_cache.list_entries().len();
+            let lookup_result = file_metadata_cache.get(&self.object_meta.location);
+            match lookup_result {
+                Some(cached) => {
+                    let valid = cached.is_valid_for(self.object_meta);
+                    let parquet_downcast_ok = cached
+                        .file_metadata
+                        .as_any()
+                        .downcast_ref::<CachedParquetMetaData>()
+                        .is_some();
+                    println!(
+                        "[COMET-CACHE] lookup file={} cache_ptr={} cache_size_bytes={} cache_entries={} hit=true valid={} parquet_ok={}",
+                        self.object_meta.location,
+                        cache_ptr_str,
+                        cache_limit,
+                        entries_count,
+                        valid,
+                        parquet_downcast_ok,
+                    );
+                    if valid && parquet_downcast_ok {
+                        let cached_parquet = cached
+                            .file_metadata
+                            .as_any()
+                            .downcast_ref::<CachedParquetMetaData>()
+                            .expect("checked above");
+                        return Ok(Arc::clone(cached_parquet.parquet_metadata()));
+                    }
+                }
+                None => {
+                    println!(
+                        "[COMET-CACHE] lookup file={} cache_ptr={} cache_size_bytes={} cache_entries={} hit=false",
+                        self.object_meta.location,
+                        cache_ptr_str,
+                        cache_limit,
+                        entries_count,
+                    );
+                }
+            }
+        } else {
+            println!(
+                "[COMET-CACHE] lookup file={} cache_disabled cache_metadata={} has_cache={}",
+                self.object_meta.location,
+                cache_metadata,
+                self.file_metadata_cache.is_some(),
+            );
         }
 
         let file_size = self.object_meta.size;
@@ -177,10 +222,22 @@ impl<'a> DFParquetMetadata<'a> {
                 .map_err(DataFusionError::from)?;
         }
 
+        let mut fetch_iterations = 0u32;
+        let mut total_fetch_bytes = 0u64;
         let metadata = loop {
             match decoder.try_decode().map_err(DataFusionError::from)? {
                 DecodeResult::Data(metadata) => break metadata,
                 DecodeResult::NeedsData(ranges) => {
+                    fetch_iterations += 1;
+                    let iter_bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+                    total_fetch_bytes += iter_bytes;
+                    println!(
+                        "[COMET-CACHE] metadata_fetch_iter file={} iter={} num_ranges={} bytes={}",
+                        self.object_meta.location,
+                        fetch_iterations,
+                        ranges.len(),
+                        iter_bytes,
+                    );
                     let buffers = self
                         .store
                         .get_ranges(&self.object_meta.location, &ranges)
@@ -198,16 +255,30 @@ impl<'a> DFParquetMetadata<'a> {
                 }
             }
         };
+        println!(
+            "[COMET-CACHE] metadata_decoded file={} iterations={} total_fetch_bytes={} has_col_idx={} has_off_idx={}",
+            self.object_meta.location,
+            fetch_iterations,
+            total_fetch_bytes,
+            metadata.column_index().is_some(),
+            metadata.offset_index().is_some(),
+        );
 
         let metadata = Arc::new(metadata);
 
         if cache_metadata && let Some(file_metadata_cache) = &self.file_metadata_cache {
+            let entries_before = file_metadata_cache.list_entries().len();
             file_metadata_cache.put(
                 &self.object_meta.location,
                 CachedFileMetadataEntry::new(
                     self.object_meta.clone(),
                     Arc::new(CachedParquetMetaData::new(Arc::clone(&metadata))),
                 ),
+            );
+            let entries_after = file_metadata_cache.list_entries().len();
+            println!(
+                "[COMET-CACHE] cache_put file={} cache_ptr={} entries_before={} entries_after={}",
+                self.object_meta.location, cache_ptr_str, entries_before, entries_after,
             );
         }
 

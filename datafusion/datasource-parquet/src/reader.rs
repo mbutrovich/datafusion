@@ -205,6 +205,12 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>> {
+        println!(
+            "[DF-OPENER] create_reader partition={} file={} range={:?}",
+            partition_index,
+            partitioned_file.object_meta.location,
+            partitioned_file.range,
+        );
         let file_metrics = ParquetFileMetrics::new(
             partition_index,
             partitioned_file.object_meta.location.as_ref(),
@@ -296,6 +302,7 @@ impl AsyncFileReader for CachedParquetFileReader {
         let metadata_cache = Arc::clone(&self.metadata_cache);
 
         async move {
+            let start = std::time::Instant::now();
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = options
                 .and_then(|o| o.file_decryption_properties())
@@ -304,7 +311,7 @@ impl AsyncFileReader for CachedParquetFileReader {
             #[cfg(not(feature = "parquet_encryption"))]
             let file_decryption_properties = None;
 
-            DFParquetMetadata::new(&self.store, &object_meta)
+            let result = DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
                 .with_metadata_size_hint(self.metadata_size_hint)
@@ -315,7 +322,19 @@ impl AsyncFileReader for CachedParquetFileReader {
                         "Failed to fetch metadata for file {}: {e}",
                         object_meta.location,
                     ))
-                })
+                });
+            let elapsed = start.elapsed();
+            if let Ok(ref meta) = result {
+                println!(
+                    "[DF-META] get_metadata file={} elapsed={:?} has_col_idx={} has_off_idx={} num_rg={}",
+                    object_meta.location,
+                    elapsed,
+                    meta.column_index().is_some(),
+                    meta.offset_index().is_some(),
+                    meta.num_row_groups(),
+                );
+            }
+            result
         }
         .boxed()
     }

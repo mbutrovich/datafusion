@@ -350,6 +350,11 @@ impl ParquetOpenState {
                 #[cfg(feature = "parquet_encryption")]
                 encryption_context,
             } => {
+                println!(
+                    "[COMET-OPENER] state=Start file={} range={:?}",
+                    prepared.partitioned_file.object_meta.location,
+                    prepared.partitioned_file.range,
+                );
                 #[cfg(feature = "parquet_encryption")]
                 {
                     let mut prepared = *prepared;
@@ -374,15 +379,28 @@ impl ParquetOpenState {
                 Ok(ParquetOpenState::LoadEncryption(future))
             }
             ParquetOpenState::PruneFile(prepared) => {
+                let file = prepared.partitioned_file.object_meta.location.clone();
                 let Some(prepared) = (*prepared).prune_file()? else {
+                    println!(
+                        "[COMET-OPENER] state=PruneFile file={} pruned=true (done)",
+                        file
+                    );
                     return Ok(ParquetOpenState::Done);
                 };
+                println!("[COMET-OPENER] state=PruneFile file={} pruned=false", file);
                 Ok(ParquetOpenState::LoadMetadata(prepared.load().boxed()))
             }
             ParquetOpenState::LoadMetadata(future) => {
                 Ok(ParquetOpenState::LoadMetadata(future))
             }
             ParquetOpenState::PrepareFilters(loaded) => {
+                let file = loaded
+                    .prepared
+                    .partitioned_file
+                    .object_meta
+                    .location
+                    .clone();
+                println!("[COMET-OPENER] state=PrepareFilters file={}", file);
                 let prepared_filters = loaded.prepare_filters()?;
                 Ok(ParquetOpenState::LoadPageIndex(
                     prepared_filters.load_page_index().boxed(),
@@ -392,6 +410,19 @@ impl ParquetOpenState {
                 Ok(ParquetOpenState::LoadPageIndex(future))
             }
             ParquetOpenState::PruneWithStatistics(prepared) => {
+                let file = prepared
+                    .loaded
+                    .prepared
+                    .partitioned_file
+                    .object_meta
+                    .location
+                    .clone();
+                let page_pruning_set = prepared.page_pruning_predicate.is_some();
+                let pruning_set = prepared.pruning_predicate.is_some();
+                println!(
+                    "[COMET-OPENER] state=PruneWithStatistics file={} has_page_pruning={} has_pruning_pred={}",
+                    file, page_pruning_set, pruning_set,
+                );
                 let prepared_row_groups = prepared.prune_row_groups()?;
                 Ok(ParquetOpenState::LoadBloomFilters(
                     prepared_row_groups.load_bloom_filters().boxed(),
@@ -400,10 +431,30 @@ impl ParquetOpenState {
             ParquetOpenState::LoadBloomFilters(future) => {
                 Ok(ParquetOpenState::LoadBloomFilters(future))
             }
-            ParquetOpenState::PruneWithBloomFilters(loaded) => Ok(
-                ParquetOpenState::BuildStream(Box::new(loaded.prune_bloom_filters())),
-            ),
+            ParquetOpenState::PruneWithBloomFilters(loaded) => {
+                let file = loaded
+                    .prepared
+                    .loaded
+                    .prepared
+                    .partitioned_file
+                    .object_meta
+                    .location
+                    .clone();
+                println!("[COMET-OPENER] state=PruneWithBloomFilters file={}", file);
+                Ok(ParquetOpenState::BuildStream(Box::new(
+                    loaded.prune_bloom_filters(),
+                )))
+            }
             ParquetOpenState::BuildStream(prepared) => {
+                let file = prepared
+                    .prepared
+                    .loaded
+                    .prepared
+                    .partitioned_file
+                    .object_meta
+                    .location
+                    .clone();
+                println!("[COMET-OPENER] state=BuildStream file={}", file);
                 Ok(ParquetOpenState::Ready(prepared.build_stream()?))
             }
             ParquetOpenState::Ready(stream) => Ok(ParquetOpenState::Ready(stream)),
