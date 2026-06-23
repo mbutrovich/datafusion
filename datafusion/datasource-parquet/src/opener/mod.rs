@@ -434,6 +434,7 @@ impl ParquetOpenState {
             ParquetOpenState::PruneWithBloomFilters(loaded) => {
                 let file = loaded
                     .prepared
+                    .prepared
                     .loaded
                     .prepared
                     .partitioned_file
